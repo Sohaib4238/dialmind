@@ -1,0 +1,35 @@
+# Pinned from the working venv (Python 3.13). Direct dependencies first, then what they pull in.
+aiohttp==3.14.5
+cryptography==50.0.2
+fastapi==0.162.0
+pydantic==2.14.1
+python-dotenv==1.2.4
+PyYAML==6.0.3
+ruamel.yaml==0.19.1
+sqlmodel==0.0.48
+sse-starlette==3.6.0
+tzdata==2025.2
+uvicorn==0.54.0
+websockets==17.3
+# Pulled in by the above
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+cffi==2.1.1
+click==8.5.0
+frozenlist==1.8.0
+h11==0.16.0
+idna==3.20
+multidict==7.2.1
+opentelemetry-api==1.45.1
+propcache==0.5.4
+pycparser==3.12
+pydantic_core==2.50.1
+SQLAlchemy==2.1.6
+starlette==1.10.0
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+yarl==1.25.1

@@ -1,0 +1,51 @@
+# Secrets: only the blank template is ever committed
+.env
+.env.*
+!.env.example
+dashboard_users.json
+dashboard_users.json.tmp
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data: leads, call history, recordings, logs
+data/
+logs/
+config/backups/
+config/*.tmp
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Audio: never commit recordings or stock sounds (see dashboard/backend/app/sounds/README.md)
+*.wav
+*.mp3
+*.ogg
+*.m4a
+
+# Python
+.venv/
+venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Node / Next.js
+node_modules/
+.next/
+.next-*/
+*.tsbuildinfo
+
+# Editors, OS, local tool settings
+floorplan/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

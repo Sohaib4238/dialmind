@@ -1,0 +1,310 @@
+# DialMind: agent settings (EXAMPLE, for a fictional company). Replace the wording with your own.
+#
+# Everything the agent says and how it behaves on a call. Validated by shared/settings.py and turned into the
+# agent's system prompt by dashboard/backend/app/agent_config.py.
+#
+# Placeholders you can use in any text: {caller_name}, {company_name}, {callback_number}, {company_website},
+# {company_address}
+# Lead details (different on every call, from the Leads list; may be empty): {lead_name}, {business_name},
+# {service_required}, {business_description}, {job_description}, {location}, and {specialist_title}: who we hand
+# them to, from their service (see specialist_titles), like "our senior web designer" (it already includes "our").
+# Multi-line text: use "|" and indent the lines below it (see main_script).
+
+# Who is calling. Shown to the AI and filled into {company_name} / {caller_name} in any text.
+company_name: Example Agency
+caller_name: Taylor
+
+# Our phone number for call-backs: said in the voicemail message as {callback_number} and put in every email.
+company_phone: (945) 555-0142
+# Our website, for {company_website} (optional).
+company_website: ""
+# Our business address (street, city, state, zip). US law requires it in every marketing email:
+# no email is sent while it's empty.
+company_address: ""
+
+# The first thing the agent says, right after the person picks up and says hello
+# (or after a few seconds of silence). The AI is told to say it exactly like this.
+opening_line: Hey, this is {caller_name} from {company_name}. Did I catch you at an okay time?
+
+# When the person picks up and says nothing.
+call_start:
+  # The AI gives them a moment to say hello, then greets them itself. Off: it waits until they speak.
+  greet_if_silent: true
+  # How long it waits for their hello (2-8 seconds). If they speak sooner, it answers them right away.
+  wait_seconds: 4
+  # What it says after the wait. A sentence with an empty lead detail is left out, so no name means no "is this...?".
+  silent_greeting: Hi, is this {lead_name}? This is {caller_name} from {company_name}.
+
+# How the agent should sound. Applies to every reply.
+speaking_style: |
+  - Talk like a real person on the phone: relaxed, warm, confident, never pushy.
+  - Short sentences. One or two per reply. Never more than about 25 words.
+  - Use contractions: I'm, you're, that's, we'd.
+  - Sometimes start with a natural filler like "yeah", "got it", "sure", "oh nice", "makes sense".
+    Not every time, and don't repeat the same one twice in a row.
+  - At most ONE question per reply, at the end. Never two questions in a row. Then stop and listen.
+  - Never list things. If there are several options, mention one or two in a normal sentence.
+  - If you didn't catch something, say so simply: "Sorry, I missed that, what was it?"
+  - If they interrupt you, stop, and respond to what they just said.
+
+# Main script: used when a real person picked up. {service_required} is what this lead asked for (may be empty).
+main_script: |
+  You're calling about the service on this lead: {service_required}. If it's empty, ask what they'd like help with.
+  1. After the opening line, mention what they were looking for and ask about their business.
+  2. Ask what's working or not with what they have now.
+  3. Listen. Reflect back one specific thing they said, so they know you heard them.
+  4. If there's interest, offer a short free call with {specialist_title}.
+  Keep it a conversation, not a pitch.
+
+# Used when an AI receptionist, virtual assistant or phone menu answers instead of a person.
+ai_receptionist_script: |
+  You've reached an automated assistant, not the business owner.
+  Politely say who you are and ask to be connected to the owner or the person who handles
+  {service_required} (or their marketing, if that's empty).
+  If they offer to take a message, leave a short one with your name and company and say you'll try again.
+
+# When a call reaches voicemail. Either way the lead is tried again later (dialer: voicemail_retries).
+voicemail:
+  # Off: hang up at once (saves Cartesia minutes). On: the AI waits for the beep, says the message below, and
+  # our backend hangs up right after it.
+  leave_message: false
+  # The message (at most about 20 seconds, 50 words). Lead details work here; an empty one is left out.
+  message: |
+    Hi {lead_name}, this is {caller_name} from {company_name}. We saw you're looking for {service_required}.
+    Give us a call back at {callback_number}. Thanks!
+
+# Follow-up emails, sent right after a call to leads with an email address (from the CSV, or confirmed on the call).
+# The account is set in .env (SMTP_...). EMAIL_TEST_MODE (default on) sends every email to EMAIL_TEST_ADDRESS.
+# Every email gets a footer added: company name, call-back number, business address and a "reply STOP" line.
+# Never sent to Do-Not-Contact leads. Empty lead details become "there", "your business", "your project".
+emails:
+  # Send follow-up emails at all.
+  enabled: true
+  # At most this many emails in 24 hours (Gmail allows about 500 a day; stay well under it).
+  daily_limit: 50
+  # Also email leads we reached on voicemail (only if their email is in the CSV).
+  after_voicemail: false
+  # Interested (or transferred to our senior specialist).
+  interested:
+    subject: Great talking with you, {lead_name}
+    body: |
+      Hi {lead_name},
+
+      Thanks for taking my call today. It was good to hear about {business_name} and what you need for {service_required}.
+
+      Next step: {specialist_title} will reach out to set up a free 15-minute call.
+      If you'd like to pick the time yourself, just reply to this email or call us at {callback_number}.
+
+      Talk soon,
+      {caller_name}
+      {company_name}
+  # Not now / call back later (also when our senior specialist couldn't take the call). {callback_time} = when we'll call.
+  callback:
+    subject: Quick note from {company_name}
+    body: |
+      Hi {lead_name},
+
+      Thanks for your time today. As promised, here's a quick note about {service_required}.
+      {company_name} helps small businesses with services like this.
+
+      We'll give you a call {callback_time}. If another time suits you better, just reply to this email.
+
+      Thanks,
+      {caller_name}
+      {company_name}
+  # They asked for details by email (and nothing above fits).
+  details:
+    subject: The details you asked for
+    body: |
+      Hi {lead_name},
+
+      As promised, here are the details about {company_name} and what we do.
+
+      Website: {company_website}
+      Phone: {callback_number}
+
+      If you'd like a free 15-minute call with {specialist_title} about {service_required}, just reply to this email.
+
+      Thanks,
+      {caller_name}
+      {company_name}
+  # After voicemail (only if after_voicemail is on).
+  voicemail_followup:
+    subject: Sorry I missed you, {lead_name}
+    body: |
+      Hi {lead_name},
+
+      I just tried to call you about {service_required}. No rush: I'd be happy to share a few ideas.
+
+      Call us back at {callback_number} or reply to this email whenever it suits you.
+
+      Thanks,
+      {caller_name}
+      {company_name}
+
+# Follow-up texts (SMS) after calls, sent from our Telnyx number. One text per lead, ever. Never to Do-Not-Contact leads, never after
+# a rude call / "stop calling", a transfer or a wrong number. Only inside the lead's calling hours (else queued).
+# Every text gets the company name and "Reply STOP to opt out" added if the template leaves them out.
+# Placeholders: {lead_name}, {company_name}, {callback_number}, {service_required}, {specialist_title}, {callback_time}.
+sms:
+  # Send follow-up texts at all.
+  enabled: true
+  # At most this many texts in total in 24 hours.
+  daily_limit: 50
+  # Nobody answered, voicemail, bad line, or someone else picked up.
+  not_answered: Hi {lead_name}, this is {caller_name} from {company_name}. Sorry we missed you about {service_required}. Call us back at {callback_number}. Reply STOP to opt out.
+  # They said no, politely.
+  not_interested: Thanks for your time today, {lead_name}. If you ever need help with {service_required}, {company_name} is at {callback_number}. Reply STOP to opt out.
+  # Not now / call back later (also when our senior specialist couldn't take the call). {callback_time} = when we'll call.
+  not_now: Thanks {lead_name}! {company_name} will call you {callback_time} about {service_required}. Another time better? Reply here or call {callback_number}. Reply STOP to opt out.
+  # Interested, or they asked for details.
+  interested: Great talking with you, {lead_name}! Next, {specialist_title} from {company_name} will reach out about {service_required}. Questions? Call {callback_number}. Reply STOP to opt out.
+
+# Who the lead is handed to, by their service: {specialist_title} in any text. The lead never hears
+# "supervisor" or "manager" (the dashboard still calls it the Supervisor).
+specialist_titles:
+  # One per line: the title, a colon, then keywords from "service required" (commas). The first line that matches
+  # wins; matched as whole words, plurals count. Said as "our <title>", e.g. "our senior web designer".
+  by_service: |
+    senior UI/UX designer: ui/ux, ux/ui, ui, ux, ui design, ux design, user interface, user experience
+    senior web designer: web design, website, web site, site, web development, web app, redesign, landing page, ecommerce, e-commerce, online store, online shop, shopify, wordpress, webflow, wix, squarespace
+    senior graphic designer: graphic design, graphics, logo, branding, brand identity, brand design, rebrand, rebranding, social media design, social media graphics, flyer, brochure
+    senior app developer: mobile app, app, app development, ios, android, iphone app
+    senior marketing specialist: seo, search engine optimization, digital marketing, online marketing, internet marketing, marketing, social media
+  # Empty or unclear service: said exactly like this.
+  default: one of our senior specialists
+
+# What the agent says right before transferring the call to our senior specialist (they said yes on the dashboard).
+transfer_intro: Great news, they're free. Connecting you with {specialist_title} now, please stay on the line.
+
+# Our senior specialist can't take the call right now (busy, no answer, or switched to unavailable).
+senior_unavailable:
+  # What the agent says to the lead.
+  message: Sorry, {specialist_title} is with a client right now. When's a good time for them to call you back?
+  # How the agent should schedule the callback.
+  scheduling_instructions: |
+    Ask what day and time works for them.
+    Offer two simple options if they're unsure, like tomorrow morning or tomorrow afternoon.
+    Confirm the time back to them in one short sentence.
+
+# Common objections and how to handle them. Keep each response short and friendly.
+objection_handling:
+  - objection: Not interested
+    response: Acknowledge it, ask one light question to check (like whether they're happy with their current site). If still no, wrap up politely.
+  - objection: Too busy right now
+    response: Offer to call back at a better time, or keep it to one quick question.
+  - objection: We already have one (a website, an app, a logo...)
+    response: Say that's great, and ask how it's working for them, like whether it brings in customers.
+  - objection: How much does it cost?
+    response: Say it depends on what they need, and that {specialist_title} can give a real number on a short call.
+  - objection: Is this a robot / AI?
+    response: Be honest that you're an AI assistant calling for {company_name}, and offer to connect them with a person.
+
+# When and how to end the call.
+goodbye:
+  rules: |
+    - If they're clearly not interested, or ask you to stop calling, don't push. Thank them and say goodbye.
+    - If they're rude, stay polite, say a short goodbye, and end.
+    - Once a next step is agreed, confirm it in one sentence and say goodbye.
+    - Keep the goodbye to one short sentence.
+  # Example of a good goodbye line (the AI may adapt it slightly).
+  line: No worries at all, thanks for your time. Have a good one!
+
+# The agent's voice (Cartesia). Easiest to change on the dashboard's Voice page.
+voice:
+  # Always cartesia: calls run on Cartesia.
+  provider: cartesia
+  # Cartesia voice ID (Kyle - warm, conversational US male).
+  voice_id: c961b81c-a935-4c17-bfb3-ba2239de8c2f
+  # Speaking speed, 1.0 = normal (0.6-1.5).
+  speed: 1.0
+  # Loudness, 1.0 = normal (0.5-2.0).
+  volume: 1.0
+  # Quiet background sound under the voice. Only the lead hears it: it doesn't go into speech recognition.
+  ambience:
+    # Off by default.
+    enabled: false
+    # Chosen on the Voice page. No sound files ship with the repo: add your own (app/sounds/README.md).
+    sound: office
+    # Loudness of the sound, 5-100%. Keep it low so the voice stays clear.
+    volume_percent: 30
+
+# When the callee goes quiet. They may have hung up (Cartesia doesn't notice), or have a bad line.
+silence:
+  # Turn the silence check-ins and the automatic hang-up on or off.
+  enabled: true
+  # Seconds of silence before each check-in (5-60).
+  silence_check_seconds: 8
+  # Close the line after this many seconds of silence (at least 2 x silence_check_seconds + 4, max 240).
+  max_silence_seconds: 25
+  # First check-in.
+  check_message: Hello, can you hear me okay?
+  # Second check-in, said right before the agent hangs up.
+  close_message: Sorry, I think the line is bad. I'll try you again another time.
+
+# Auto-dialer (the ON/OFF switch on the Leads page). It calls one lead at a time.
+dialer:
+  # Stop after this many calls in one ON session.
+  max_calls_per_session: 3
+  # Lead statuses that get called again (busy counts as no_answer).
+  retry_statuses: [no_answer, bad_line]
+  # How many extra tries after the first call.
+  max_retries: 2
+  # Minimum hours between two calls to the same lead.
+  retry_gap_hours: 2
+  # Pause the dialer after this many failed calls in a row.
+  pause_after_failures: 3
+  # Stop the dialer when the estimated free Cartesia minutes left drop below this.
+  min_free_minutes: 2
+  # Voicemail: how many more tries. Each try is at a different time of day than the last one
+  # (morning vs afternoon, in the lead's own time zone).
+  voicemail_retries: 2
+  # "Not now" or a gatekeeper with no time given: call back after this many days.
+  # If the lead gives a time, that time is used instead.
+  callback_default_days: 3
+  # After this many callbacks in a row the lead goes to "Needs review" instead of another callback.
+  max_callbacks: 3
+
+# Service fit: skip leads whose "service required" is clearly something we don't sell.
+# A lead is skipped (status "Not a fit") only if its service matches a "not offered" keyword and
+# none of the "offered" ones. Empty or unclear services are called. "Call anyway" on the lead page overrides it.
+# Saving re-checks every lead that hasn't been called yet.
+service_fit:
+  # Turn the check on or off.
+  enabled: true
+  # What this fictional agency sells (an example list). One service per line: its name first (the AI is told these names), then other words
+  # for it, separated by commas. Matched as whole words; plurals count.
+  offered: |
+    web design, website, web site, site, web designer, webflow, wix, squarespace
+    website development, web development, web developer, web app, booking page
+    website redesign, redesign
+    landing pages, landing page
+    ecommerce, e-commerce, online store, online shop, shopify, wordpress
+    graphic design, graphic designer, graphics, flyer, brochure
+    logo design, logo
+    branding, brand identity, brand design, rebrand, rebranding
+    mobile app development, mobile app, app, app development, app developer, ios, android, iphone app
+    ui/ux design, ui/ux, ux/ui, ui, ux, user interface, user experience
+    seo, search engine optimization
+    digital marketing, online marketing, internet marketing
+    social media design, social media graphics, social media posts, social media
+  # Services we don't offer (commas or one per line). Only these clear mismatches are skipped.
+  not_offered: |
+    plumbing, plumber, roofing, roofer, hvac, electrician, electrical work
+    landscaping, lawn care, cleaning, janitorial, pest control, painting
+    construction, remodeling, flooring, moving, movers
+    accounting, accountant, bookkeeping, tax preparation, taxes, payroll
+    legal advice, lawyer, attorney, insurance, mortgage, loan
+    catering, auto repair, towing, staffing, recruiting
+
+# Call settings.
+settings:
+  # The auto-dialer only calls a lead inside these hours, in the lead's own time zone (from the area code).
+  calling_hours:
+    start: "09:00"
+    end: "18:00"
+    days: [mon, tue, wed, thu, fri]
+  # Hang up politely after this many minutes.
+  max_call_minutes: 10
+  # Delete our copy of a call's recording this many days after the call. 0 = keep forever.
+  recordings_keep_days: 30

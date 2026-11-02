@@ -1,0 +1,36 @@
+# Automatic HTTPS (Let's Encrypt), one certificate per hostname. The sslip.io one can go once nobody uses it.
+{
+	servers {
+		# HTTP/3 would need UDP 443, which the firewall keeps closed
+		protocols h1 h2
+	}
+}
+
+dialer.example.com, 203-0-113-10.sslip.io {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+	request_body {
+		max_size 20MB
+	}
+
+	# API + live updates (WebSocket /api/live) go straight to the backend, no buffering.
+	# Caddy sets X-Forwarded-For itself. A client-sent Cf-Connecting-Ip would let an attacker dodge the
+	# login lockout (auth.client_ip reads it first), so it's removed.
+	handle /api/* {
+		reverse_proxy backend:8000 {
+			header_up -Cf-Connecting-Ip
+			header_up -Cf-Ray
+			flush_interval -1
+		}
+	}
+
+	handle {
+		encode zstd gzip
+		reverse_proxy frontend:3000
+	}
+}

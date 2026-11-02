@@ -1,0 +1,19 @@
+# Backend image. Code only: data, settings, logs and .env live on the server's disk (docker-compose.yml).
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+COPY dashboard/backend/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+# Background sounds uploaded on the Voice page (app/ambience.py)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
+COPY shared/ shared/
+COPY dashboard/backend/ dashboard/backend/
+COPY config/agent_settings.yaml config/agent_settings.yaml
+COPY deploy/backend_entrypoint.sh /usr/local/bin/backend_entrypoint.sh
+
+WORKDIR /app/dashboard/backend
+USER 1000:1000
+ENTRYPOINT ["sh", "/usr/local/bin/backend_entrypoint.sh"]

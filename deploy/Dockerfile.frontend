@@ -1,0 +1,18 @@
+# Frontend image: `next build` in a throwaway stage, then only a small standalone server is kept.
+FROM node:24-slim AS build
+# Keeps the build within RAM + swap on the 1 GB server
+ENV NEXT_TELEMETRY_DISABLED=1 NODE_OPTIONS=--max-old-space-size=1536
+WORKDIR /app
+COPY dashboard/frontend/package.json dashboard/frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY dashboard/frontend/ ./
+# NEXT_OUTPUT: standalone server. DASHBOARD_BACKEND_URL: Next.js fixes its /api rewrite at build time.
+RUN NEXT_OUTPUT=standalone DASHBOARD_BACKEND_URL=http://backend:8000 npm run build
+
+FROM node:24-slim
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0 NODE_OPTIONS=--max-old-space-size=200
+WORKDIR /app
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+USER 1000:1000
+CMD ["node", "server.js"]

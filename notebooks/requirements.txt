@@ -1,0 +1,7 @@
+# To re-run call_analytics.ipynb. It needs no keys and no network: all its data is generated in the notebook.
+ipykernel==7.4.0
+matplotlib==3.11.2
+nbconvert==7.17.2
+nbformat==5.11.1
+numpy==2.5.4
+pandas==3.1.0

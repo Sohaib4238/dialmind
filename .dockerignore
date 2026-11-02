@@ -1,0 +1,13 @@
+# Allow-list: only what the images need goes into the build. .env, data/, logs/, keys and docs never do.
+*
+!shared/
+!dashboard/backend/
+!dashboard/frontend/
+!config/agent_settings.yaml
+!deploy/backend_entrypoint.sh
+**/__pycache__/
+**/*.pyc
+**/.env*
+dashboard/frontend/node_modules/
+dashboard/frontend/.next*/
+dashboard/frontend/tsconfig.tsbuildinfo
