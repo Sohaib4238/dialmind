@@ -9,10 +9,11 @@ import { toast } from "sonner"
 import { Panel, SkeletonLine } from "@/components/common"
 import { useIsAdmin } from "@/components/login-gate"
 import { Button } from "@/components/ui/button"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api, ApiError } from "@/lib/api"
 import { formatPhone } from "@/lib/format"
 import { useLiveStream } from "@/lib/live"
-import type { DialerState } from "@/lib/types"
+import type { DialerOrder, DialerState } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const EASE = [0.22, 1, 0.36, 1] as const
@@ -57,6 +58,15 @@ export function DialerPanel() {
       toast.error(e instanceof ApiError ? e.message : "Couldn't change test mode")
     } finally {
       setBusy(false)
+    }
+  }
+
+  const setOrder = async (order: DialerOrder) => {
+    try {
+      setD(await api.setDialerOrder(order))
+      toast.success(order === "sheet" ? "New leads are called in sheet order" : "Newest leads are called first")
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : "Couldn't change the order")
     }
   }
 
@@ -141,7 +151,7 @@ export function DialerPanel() {
             <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat label="Calls this session" value={`${d.session_calls} / ${max}`} />
               <Stat label="Failed in a row" value={String(d.failures_in_row)} tone={d.failures_in_row ? "warn" : undefined} />
-              <Stat label="Free minutes left" value={`~${d.minutes_left}`} tone={d.minutes_left < (d.limits.min_free_minutes ?? 2) + 2 ? "warn" : undefined} />
+              <Stat label="Minutes left" value={`~${d.minutes_left}`} tone={d.minutes_left < (d.limits.min_free_minutes ?? 2) + 2 ? "warn" : undefined} />
               <Stat label="Calling hours" value={d.limits.hours ?? "–"} sub="lead's local time" />
             </dl>
 
@@ -160,7 +170,22 @@ export function DialerPanel() {
                 )}
               </div>
               <div className="rounded-lg border border-border p-3">
-                <div className="mb-1 flex items-center gap-1.5 text-[12px] text-faint"><PhoneForwarded className="size-3.5" strokeWidth={1.5} /> Next in the queue</div>
+                <div className="mb-1 flex items-center gap-1.5 text-[12px] text-faint">
+                  <PhoneForwarded className="size-3.5" strokeWidth={1.5} /> Next in the queue
+                  {d.order && d.orders && (admin ? (
+                    <Select value={d.order} onValueChange={(x) => setOrder(x as DialerOrder)}>
+                      <SelectTrigger size="sm" aria-label="Order of new leads"
+                        className="ml-auto h-6 gap-1 border-transparent bg-transparent px-1.5 text-[12px] text-muted-foreground hover:bg-surface-2 data-[size=sm]:h-6">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent align="end">
+                        {(Object.keys(d.orders) as DialerOrder[]).map((k) => <SelectItem key={k} value={k}>{d.orders![k]}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <span className="ml-auto">{d.orders[d.order]}</span>
+                  ))}
+                </div>
                 {d.next ? (
                   <Link href={`/leads/${d.next.lead_id}`} className="block truncate text-[13px] font-medium hover:underline">
                     {d.next.name || formatPhone(d.next.phone)}

@@ -18,8 +18,9 @@ from zoneinfo import ZoneInfo
 
 from sqlmodel import select
 
-from app import cartesia, cartesia_setup, emails, leads, outcomes, sms, storage, supervisor, test_mode
-from app.agent_config import EMAIL_REASONS, EMAIL_TOOL_NAME, lead_variables, silent_greeting, supervisor_enabled, time_variables
+from app import cartesia, cartesia_setup, emails, inbound, leads, outcomes, sheet_sync, sms, storage, supervisor, test_mode
+from app.agent_config import (EMAIL_REASONS, EMAIL_TOOL_NAME, introduction, lead_variables, silent_greeting,
+                              supervisor_enabled, time_variables)
 from app.bus import bus
 from app.db import Call, CallEvent, Lead, as_utc, call_to_dict, event_to_dict, get_session, utcnow
 from app.timezones import lead_timezone
@@ -45,10 +46,13 @@ GOODBYE_WAIT_MAX_S = 12  # end_call seen but no goodbye line arrives (a line onl
 # Cartesia checks in after silence_check_seconds (the agent says check_message, then close_message +
 # end_call); we close the line after the second check-in, or at max_silence_seconds at the latest.
 # Voicemail: Cartesia's voicemail tool (like end_call) doesn't close the line on our SIP trunk, so we
-# close it ourselves: right away with no voicemail message (voicemail.leave_message off), or just after the
-# AI has said the message (we see it in the transcript and estimate how long it takes to say).
-VOICEMAIL_CLOSE_S = 1.0
-VM_MESSAGE_START_WAIT_S = 8  # message on, greeting heard: time for the beep + the AI to start the message
+# close it ourselves: right away with no voicemail message (voicemail.leave_message off), or 1.5 s after the
+# AI has said the whole message (message on: no voicemail tool, the AI says it after the beep, then end_call).
+# An agent line only reaches us once it has been said, so after the greeting we wait for the rest of the
+# greeting, the beep and the whole message (vm_wait_s), not a fixed few seconds (History #40, #42: closed at 8 s).
+VOICEMAIL_CLOSE_S = 1.0  # message off: after the voicemail tool / greeting
+VM_MESSAGE_CLOSE_S = AFTER_GOODBYE_CLOSE_S  # message on: after the message's audio has finished
+VM_MESSAGE_SLACK_S = 25  # message on, greeting heard: rest of the greeting + the beep + the AI's reply time
 VM_MESSAGE_MATCH = 0.5  # share of the message's words an agent turn must contain to count as the message
 CHECKIN_SLACK_S = 1.5  # an agent turn after >= (silence_check_seconds - this) of quiet = a check-in
 CLOSE_AFTER_SECOND_CHECKIN_S = 6  # time for the closing line + end_call before we cut it ourselves
@@ -145,11 +149,14 @@ def apply_status(call_id: int, status: str, detail: str = "", data: dict | None 
     if status in FINAL:
         _debug(call_id, "outcome", outcomes.label(call.outcome), outcome=call.outcome, source=call.outcome_source,
                note=call.outcome_note or None, callback_at=call_to_dict(call)["callback_at"])
+    if status in FINAL and call.direction == "inbound":
+        call = manager._inbound_lead_at_end(call)
     _publish_call(call)
     if status in FINAL:
         leads.on_call_finished(call)
         emails.after_call(call_id)  # follow-up email (background), if the outcome calls for one
         sms.after_call(call_id)  # follow-up text (background / queued), if the outcome calls for one
+        sheet_sync.wake()  # the lead's row in the results sheet, now
     return call
 
 
@@ -205,6 +212,15 @@ def _silence_settings() -> dict:
         return {"enabled": True, "check_s": 8, "max_s": 25, "greet_wait_s": 0}
 
 
+def _max_minutes() -> int:
+    """Max call length: the settings' max_call_minutes, never above CARTESIA_MAX_CALL_MINUTES."""
+    try:
+        minutes = load_settings().settings.max_call_minutes
+    except SettingsError:
+        minutes = MAX_CALL_MINUTES_CAP
+    return max(1, min(minutes, MAX_CALL_MINUTES_CAP))
+
+
 def _voicemail_message(lead_id: int | None) -> str:
     """The voicemail message as the AI should say it on this call, "" when leave_message is off."""
     try:
@@ -220,6 +236,11 @@ def _voicemail_message(lead_id: int | None) -> str:
 def speech_seconds(text: str) -> float:
     """Roughly how long a line takes to say (~14 characters a second)."""
     return min(30.0, len((text or "").strip()) / 14)
+
+
+def vm_wait_s(message: str) -> float:
+    """Message on, greeting heard: the longest we wait for the AI's message to reach us (it arrives once said)."""
+    return speech_seconds(message) + VM_MESSAGE_SLACK_S
 
 
 _WORD_RE = re.compile(r"[a-z0-9']{3,}")
@@ -303,6 +324,8 @@ class _Tracker:
         self.transfer_turn_s: float | None = None  # call-relative time of the transfer turn
         self.transfer_failed = False
         self.email_typo_checked: set[str] = set()  # addresses the AI was asked to double-check (collect_email)
+        self.inbound = False  # they called us: no voicemail checks, and our own cap on the call's length
+        self.max_s: float | None = None  # inbound: close the line after this long (outbound: Cartesia's own cap)
 
 
 def _seed_tracker(call_id: int) -> _Tracker:
@@ -326,6 +349,7 @@ def _seed_tracker(call_id: int) -> _Tracker:
         if call.transfer_status in (supervisor.TRANSFERRING, supervisor.TRANSFERRED):  # backend restarted mid-transfer
             tr.transfer_at = 0.0
         tr.supervisor_waiting = call.transfer_status == supervisor.WAITING
+        tr.inbound = call.direction == "inbound"
     return tr
 
 
@@ -365,7 +389,7 @@ class CallManager:
         with get_session() as s:
             stale = s.exec(select(Call).where(Call.status.in_(ACTIVE))).all()
         for c in stale:
-            if c.source == "dashboard" and c.room.startswith("ac_"):
+            if c.source in ("dashboard", "inbound") and c.room.startswith("ac_"):
                 # Re-check with Cartesia right away; the poller ends it if Cartesia says it's over.
                 _debug(c.id, "recheck_after_restart", "Backend restarted: re-checking this call with Cartesia")
                 self._spawn(self._poll(c.id, c.room))
@@ -386,6 +410,8 @@ class CallManager:
             raise CallError(blocked)  # the lead itself is DNC (test mode dials another number)
         if lead_id is None and (lead := leads.find_by_phone(number)):
             lead_id = lead.id  # a manual call to a lead's number still counts for that lead
+            if blocked := leads.sales_block_reason(lead):
+                raise CallError(blocked)  # the sales team has it (green/yellow row in their sheet)
         try:
             dial = test_mode.route(number)  # TEST MODE: every call (dialer, retry, callback, manual) -> test number
         except test_mode.TestModeError as e:
@@ -424,6 +450,7 @@ class CallManager:
         variables = {"caller_name": settings.caller_name, "company_name": settings.company_name,
                      **lead_vars, **time_variables(tz_name, utcnow()), **sup_vars,
                      "silent_greeting": silent_greeting(settings, lead_vars),
+                     "intro_line": introduction(settings, lead_vars),
                      "lead_email": lead_row.email if lead_row else ""}
         if supervisor_enabled() and sup_vars["supervisor_status"] != "available":  # interested -> callback instead
             with get_session() as s:
@@ -553,13 +580,27 @@ class CallManager:
                 _debug(call_id, "line_still_open", msg)
                 _add_event(call_id, "log", "agent", msg, {"level": "error"})
             return
+        if tr.inbound and tr.max_s and tr.started_at is not None and now - tr.started_at >= tr.max_s:
+            # No create-call request on an inbound call, so no Cartesia max_call_duration: our own cap (budget).
+            tr.close_kind = "max_length"
+            await self._close_line(call_id, agent_call_id, tr,
+                                   f"Closed the line: max call length ({tr.max_s / 60:g} min) reached", "closed_max_length")
+            return
         if tr.voicemail_at is not None:
-            if tr.vm_msg_done_at is not None:  # the AI is saying our message: close right after it
-                due, label = tr.vm_msg_done_at + VOICEMAIL_CLOSE_S, "Closed the line after leaving the voicemail message"
-            else:
+            if tr.vm_msg_done_at is not None:  # the AI has said our message: close 1.5 s after its audio ends
+                due, label = tr.vm_msg_done_at + VM_MESSAGE_CLOSE_S, "Closed the line after leaving the voicemail message"
+            elif tr.vm_message and tr.voicemail_why == "voicemail greeting heard":
+                # Message on: wait for the beep and the whole message (it reaches us only once it's said).
+                due, label = tr.voicemail_at + vm_wait_s(tr.vm_message), \
+                    "Closed the line: voicemail, but the AI didn't leave the message"
+                if tr.end_call_at is not None:  # the AI ended with some other line (not recognised as the message)
+                    if tr.goodbye_done_at is not None:
+                        due = min(due, tr.goodbye_done_at + VM_MESSAGE_CLOSE_S)
+                    else:
+                        due = min(due, tr.end_call_at + GOODBYE_WAIT_MAX_S)
+                    label = "Closed the line after the AI's last line on voicemail"
+            else:  # message off, the mailbox is full, or the voicemail tool (it ends the AI's side): close now
                 due, label = tr.voicemail_at + VOICEMAIL_CLOSE_S, f"Closed the line: reached voicemail ({tr.voicemail_why})"
-                if tr.vm_message and tr.voicemail_why == "voicemail greeting heard":
-                    due = tr.voicemail_at + VM_MESSAGE_START_WAIT_S  # give the AI time to start the message
             if now >= due:
                 tr.close_kind = "voicemail"
                 await self._close_line(call_id, agent_call_id, tr, label, "closed_on_voicemail")
@@ -620,7 +661,7 @@ class CallManager:
             tr.seen_turns.add(key)
             self._note_turn(call_id, tr, turn, role)
             start = turn.get("start_timestamp")
-            if (role == "callee" and tr.voicemail_at is None and isinstance(start, (int, float))
+            if (role == "callee" and not tr.inbound and tr.voicemail_at is None and isinstance(start, (int, float))
                     and start <= outcomes.VOICEMAIL_WITHIN_S and (kind := outcomes.voicemail_phrase(text))):
                 tr.voicemail_at = asyncio.get_running_loop().time()
                 tr.voicemail_why = f"{kind} greeting heard"
@@ -675,10 +716,8 @@ class CallManager:
 
     def _voicemail_message_said(self, call_id: int, tr: _Tracker, turn: dict, text: str) -> None:
         now = asyncio.get_running_loop().time()
-        start = turn.get("start_timestamp")
-        began = tr.started_at + start if tr.started_at is not None and isinstance(start, (int, float)) else now
         secs = speech_seconds(text)
-        tr.vm_msg_done_at = max(now, began + secs)
+        tr.vm_msg_done_at = self._line_done_at(tr, turn, text, now)  # its own timestamps when Cartesia gives them
         if tr.voicemail_at is None:
             tr.voicemail_at, tr.voicemail_why = now, "the AI left the voicemail message"
         with get_session() as s:
@@ -834,20 +873,26 @@ class CallManager:
         return call
 
     def request_payload(self, call: Call) -> dict:
-        """What the supervisor's pop-up shows: the lead, their local time, the AI's summary, the transcript."""
+        """What the supervisors' pop-up shows: the lead, their local time, the AI's summary, the transcript, who it
+        rings (offered), who said busy, and who took it."""
         lead = leads.get_lead_row(call.lead_id) if call.lead_id else None
         tz_name, _ = lead_timezone(lead.location if lead else "", lead.phone if lead else call.number)
         with get_session() as s:
             events = s.exec(select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.kind == "transcript")
                             .order_by(CallEvent.id)).all()
-        wait_s = supervisor.load()["wait_seconds"]
+        sup = supervisor.load()
+        wait_s = sup["wait_seconds"]
         dl = supervisor.deadline(call.transfer_requested_at, wait_s)
+        names = {p["key"]: p["name"] for p in sup["people"]}
         return {
-            "call_id": call.id, "lead_id": call.lead_id, "status": call.transfer_status,
+            "call_id": call.id, "lead_id": call.lead_id, "status": call.transfer_status, "direction": call.direction,
             "label": supervisor.TRANSFER_LABELS.get(call.transfer_status, call.transfer_status),
             "summary": call.transfer_summary, "note": call.transfer_note,
             "requested_at": as_utc(call.transfer_requested_at).isoformat() if call.transfer_requested_at else None,
             "deadline": dl.isoformat() if dl else None, "wait_seconds": wait_s,
+            "offered": [{"key": k, "name": names.get(k, k)} for k in call.transfer_offered or []],
+            "declined_by": list(call.transfer_declined_by or []),
+            "taken_by": call.transfer_to_name or "", "taken_by_key": call.transfer_to or "",
             "lead": {**lead_variables(lead), "phone": lead.phone if lead else call.number,
                      **time_variables(tz_name, utcnow())},
             "transcript": [{"role": e.role, "text": e.text} for e in events],
@@ -861,26 +906,31 @@ class CallManager:
             rows = s.exec(select(Call).where(Call.transfer_status == supervisor.WAITING)).all()
         return [self.request_payload(c) for c in rows if c.status not in FINAL]
 
-    async def request_supervisor_tool(self, payload: dict) -> str:
-        """The request_supervisor webhook tool (already authenticated). The first use opens the pop-up;
-        each use waits up to CHECK_WAIT_S for the supervisor's answer, then says waiting / available / not."""
+    async def request_supervisor_tool(self, payload: dict) -> dict:
+        """The request_supervisor webhook tool (already authenticated). The first use rings every available supervisor
+        (pop-up); each use waits up to CHECK_WAIT_S for an answer, then says waiting / available / not (JSON). AVAILABLE
+        carries the phone of the supervisor who accepted (saved by Cartesia into {{transfer_number}})."""
         agent_call_id = str(payload.get("call_id") or "").strip()
         with get_session() as s:
             call = s.exec(select(Call).where(Call.room == agent_call_id)).first() if agent_call_id else None
         if call is None or call.status in FINAL:
-            return supervisor.REPLY_NOT_AVAILABLE  # e.g. a Playground test
+            return supervisor.reply_for(supervisor.UNAVAILABLE)  # e.g. a Playground test
         summary = re.sub(r"\s+", " ", str(payload.get("summary") or "")).strip()[:600]
         status = call.transfer_status
         if status in ("", supervisor.UNAVAILABLE):
             sup = supervisor.load()
-            ok, why = supervisor.availability(s=sup)
-            if not ok:
+            people = supervisor.available_people(s=sup)
+            if not people:
                 if status != supervisor.UNAVAILABLE:
-                    self._set_transfer(call.id, supervisor.UNAVAILABLE, why, transfer_summary=summary)
-                return supervisor.REPLY_NOT_AVAILABLE
+                    self._set_transfer(call.id, supervisor.UNAVAILABLE, supervisor.availability(s=sup)[1],
+                                       transfer_summary=summary)
+                return supervisor.reply_for(supervisor.UNAVAILABLE)
             call = self._set_transfer(call.id, supervisor.WAITING, "", transfer_summary=summary,
-                                      transfer_requested_at=utcnow(), transfer_answered_at=None)
-            _add_event(call.id, "log", "agent", "Asked the supervisor to take the call", {"level": "info"})
+                                      transfer_requested_at=utcnow(), transfer_answered_at=None,
+                                      transfer_offered=[p["key"] for p in people], transfer_declined_by=[],
+                                      transfer_to="", transfer_to_name="", transfer_to_phone="")
+            names = ", ".join(p["name"] for p in people)
+            _add_event(call.id, "log", "agent", f"Asked {names} to take the call", {"level": "info"})
             self.sup.start_timer(call.id, sup["wait_seconds"], self._supervisor_timeout)
             status = supervisor.WAITING
         elif status == supervisor.WAITING and summary and summary != call.transfer_summary:
@@ -894,20 +944,50 @@ class CallManager:
             if status == supervisor.WAITING and dl and utcnow() >= dl:  # past the deadline: don't wait for the timer
                 self._supervisor_timeout(call.id)
                 status = supervisor.TIMEOUT
-        return supervisor.reply_for(status)
+        with get_session() as s:
+            phone = s.get(Call, call.id).transfer_to_phone
+        return supervisor.reply_for(status, phone)
 
-    def answer_supervisor(self, call_id: int, accept: bool, by: str = "") -> dict:
-        """Accept / Busy from the pop-up. Only an open (waiting) request can be answered."""
+    def answer_supervisor(self, call_id: int, accept: bool, user: str | None = None, as_key: str | None = None,
+                          admin: bool = False) -> dict:
+        """Accept / Busy from a pop-up. `user` is the login that clicked; their own supervisor entry answers. An admin
+        (or this computer, without a login) who isn't on the list may answer for one: `as_key`, or the only one rung.
+        The first Accept wins; Busy from one leaves the request open for the others (all busy = declined).
+        Runs on the event loop with no await between the check and the change, so two Accepts can't both win."""
         with get_session() as s:
             call = s.get(Call, call_id)
         if call is None:
             raise CallError("No such call.")
+        sup = supervisor.load()
+        offered = list(call.transfer_offered or [])
+        p = supervisor.person(user, sup)
+        if p is None and admin:
+            p = supervisor.person(as_key, sup) if as_key else (supervisor.person(offered[0], sup) if len(offered) == 1 else None)
+        if p is None:
+            raise CallError("Pick which supervisor takes it." if admin else "You're not on the supervisor list, so you "
+                            "can't take this call. An admin adds you on the Supervisor page.")
+        if call.transfer_status in (supervisor.ACCEPTED, supervisor.TRANSFERRING, supervisor.TRANSFERRED):
+            raise CallError(f"Too late: {call.transfer_to_name or 'another supervisor'} already took this call.")
         if call.transfer_status != supervisor.WAITING or call.status in FINAL:
             raise CallError("Too late: this request was already answered or timed out.")
-        who = f" ({by})" if by else ""
-        status = supervisor.ACCEPTED if accept else supervisor.DECLINED
-        call = self._set_transfer(call_id, status, ("accepted" if accept else "busy") + who, transfer_answered_at=utcnow())
-        _add_event(call_id, "log", "agent", f"Supervisor {'accepted' if accept else 'is busy'}{who}", {"level": "info"})
+        if accept:
+            if not p["phone"]:
+                raise CallError(f"{p['name']} has no phone number set: the call can't be transferred.")
+            call = self._set_transfer(call_id, supervisor.ACCEPTED, f"accepted by {p['name']}", transfer_answered_at=utcnow(),
+                                      transfer_to=p["key"], transfer_to_name=p["name"], transfer_to_phone=p["phone"])
+            _add_event(call_id, "log", "agent", f"{p['name']} accepted: transferring to {p['phone']}", {"level": "info"})
+            self.sup.done(call_id)
+            return self.request_payload(call)
+        declined = list(dict.fromkeys([*(call.transfer_declined_by or []), p["key"]]))
+        names = {x["key"]: x["name"] for x in sup["people"]}
+        busy = "busy: " + ", ".join(names.get(k, k) for k in declined)
+        still = [k for k in offered if k not in declined and (q := supervisor.person(k, sup))
+                 and supervisor.person_availability(q)[0]]
+        _add_event(call_id, "log", "agent", f"{p['name']} is busy", {"level": "info"})
+        if still:  # the others can still take it
+            return self.request_payload(self._set_transfer(call_id, supervisor.WAITING, busy, transfer_declined_by=declined))
+        call = self._set_transfer(call_id, supervisor.DECLINED, busy, transfer_answered_at=utcnow(),
+                                  transfer_declined_by=declined)
         self.sup.done(call_id)
         return self.request_payload(call)
 
@@ -918,7 +998,7 @@ class CallManager:
             return
         wait_s = supervisor.load()["wait_seconds"]
         self._set_transfer(call_id, supervisor.TIMEOUT, f"no answer within {wait_s}s")
-        _add_event(call_id, "log", "agent", f"Supervisor didn't answer within {wait_s}s", {"level": "info"})
+        _add_event(call_id, "log", "agent", f"No supervisor answered within {wait_s}s", {"level": "info"})
         self.sup.done(call_id)
 
     def _transfer_started(self, call_id: int, tr: _Tracker, turn: dict, tc: dict) -> None:
@@ -981,8 +1061,12 @@ class CallManager:
             tr.answered = True
             tr.started_at = tr.quiet_since = asyncio.get_running_loop().time()
             tr.silence = _silence_settings()
-            with get_session() as s:
-                tr.vm_message = _voicemail_message(s.get(Call, call_id).lead_id)
+            if tr.inbound:  # our greeting is said at once (no wait for their hello); no voicemail on a call to us
+                tr.silence = {**tr.silence, "greet_wait_s": 0}
+                tr.max_s = _max_minutes() * 60
+            else:
+                with get_session() as s:
+                    tr.vm_message = _voicemail_message(s.get(Call, call_id).lead_id)
             if tr.last_turn_end_s is None:
                 tr.last_turn_end_s = 0.0  # so a first agent line after dead air also counts as a check-in
             apply_status(call_id, "answered", "Call connected (Cartesia session started)")
@@ -997,7 +1081,10 @@ class CallManager:
         if data.get("error_message"):
             detail = f"{detail}: {data['error_message']}"
         with get_session() as s:
-            answered = bool(s.get(Call, call_id).answered_at)
+            row = s.get(Call, call_id)
+            answered = bool(row.answered_at)
+        if row.direction == "inbound":
+            detail = detail.replace("Callee", "Caller")
         heard_callee = any(t.get("role") == "user" and (t.get("text") or "").strip() for t in data.get("transcript") or [])
         tr = self.trackers.get(call_id)
         if result is None:  # a hang-up / silence / max-length kind of ending
@@ -1008,10 +1095,18 @@ class CallManager:
                     result = "bad_line"
                 elif tr.close_kind == "voicemail":
                     result = "voicemail"
+            elif tr and tr.auto_close_label and tr.close_kind == "max_length":
+                detail = tr.auto_close_label
             elif reason == "api_cancelled" and result == "no_answer":
                 detail = "Hung up from dashboard before answer"
         _debug(call_id, "end_reason", reason or "(none)", via=source, error_message=data.get("error_message"),
                summary=(data.get("summary") or "")[:500] or None)
+        if summary := re.sub(r"\s+", " ", str(data.get("summary") or "")).strip()[:1000]:
+            with get_session() as s_:
+                c_ = s_.get(Call, call_id)
+                c_.ai_summary = summary
+                s_.add(c_)
+                s_.commit()
         start, end = _parse_time(data.get("start_time")), _parse_time(data.get("end_time"))
         talk = round((end - start).total_seconds(), 1) if start and end else None
         apply_status(call_id, status, detail, {"end_reason": reason, "talk_seconds": talk}, result=result,
@@ -1037,7 +1132,11 @@ class CallManager:
         agent_call_id = payload.get("call_id") or (payload.get("call") or {}).get("id")
         with get_session() as s:
             call = s.exec(select(Call).where(Call.room == agent_call_id)).first() if agent_call_id else None
+        if call is None and agent_call_id and (data := payload.get("call")) and self._is_inbound(data):
+            call = self.inbound_call(agent_call_id, inbound.caller_from_call(data), via="webhook")
         if call is None:
+            if agent_call_id and str(agent_call_id).startswith("ac_"):
+                self._spawn(self._check_unknown_call(str(agent_call_id)))  # a turn of an inbound call we missed the start of?
             return {"ok": True, "ignored": "unknown call"}  # e.g. a Playground test call
         kind = payload.get("type")
         logger.info("webhook %s for call %s (%s)", kind, call.id, agent_call_id)
@@ -1050,6 +1149,143 @@ class CallManager:
             summary = ((payload.get("analysis") or {}).get("summary") or "")[:1000]
             _debug(call.id, "post_call_analysis", summary or "(no summary)")
         return {"ok": True, "type": kind}
+
+    # ---- inbound calls (someone called our number; app/inbound.py) -------------------------
+
+    @staticmethod
+    def _is_inbound(data: dict) -> bool:
+        """A Cartesia call object of a call to our number: by the inbound agent, or marked inbound."""
+        agent = os.getenv("CARTESIA_INBOUND_AGENT_ID", "").strip()
+        direction = str((data.get("telephony_params") or {}).get("direction") or "").lower()
+        return bool(agent and data.get("agent_id") == agent) or direction == "inbound"
+
+    def inbound_call(self, agent_call_id: str, caller: str, via: str) -> Call:
+        """The Call row of an inbound call, created the first time we hear of it (webhook, tool or poll).
+        number = the caller. Followed like an outbound call (_poll: status, transcript, hang-up rules)."""
+        with get_session() as s:
+            call = s.exec(select(Call).where(Call.room == agent_call_id)).first()
+        if call is not None:
+            if caller and not call.number:
+                with get_session() as s:
+                    row = s.get(Call, call.id)
+                    row.number = caller
+                    s.add(row)
+                    s.commit()
+                    s.refresh(row)
+                call = row
+            return call
+        phone = inbound.normalize(caller)
+        lead = leads.find_by_phone(phone) if phone else None
+        with get_session() as s:
+            call = Call(room=agent_call_id, number=phone or caller, status="ringing", source="inbound",
+                        direction="inbound", lead_id=lead.id if lead else None)
+            s.add(call)
+            s.commit()
+            s.refresh(call)
+        who = f"lead #{lead.id} {lead.name}".strip() if lead else "not in our leads"
+        _debug(call.id, "inbound_call", f"Inbound call from {phone or caller or 'a hidden number'} ({who})",
+               via=via, agent_call_id=agent_call_id, caller=caller or None, lead_id=call.lead_id)
+        _publish_call(call)
+        leads.on_inbound_call(call)
+        if not inbound.enabled():
+            _debug(call.id, "inbound_switched_off", "Inbound calls are off on the Instructions page, but Cartesia sent this one")
+        self._spawn(self._poll(call.id, agent_call_id))
+        return call
+
+    async def _check_unknown_call(self, agent_call_id: str) -> None:
+        if agent_call_id in self.seen_webhooks:  # checked already
+            return
+        self.seen_webhooks[agent_call_id] = asyncio.get_running_loop().time()
+        try:
+            data = await cartesia.get_call(agent_call_id)
+        except cartesia.CartesiaError:
+            return
+        if self._is_inbound(data):
+            call = self.inbound_call(agent_call_id, inbound.caller_from_call(data), via="poll")
+            self.ingest_call(call.id, data, source="poll")
+
+    async def _call_for_tool(self, payload: dict) -> Call | None:
+        """The call a tool request belongs to; an inbound call may reach us first through lookup_caller."""
+        agent_call_id = str(payload.get("call_id") or "").strip()
+        if not agent_call_id:
+            return None
+        with get_session() as s:
+            call = s.exec(select(Call).where(Call.room == agent_call_id)).first()
+        if call is not None or not agent_call_id.startswith("ac_"):
+            return call
+        caller = str(payload.get("caller") or "").strip()
+        if not caller or "{" in caller:
+            try:
+                data = await cartesia.get_call(agent_call_id)
+            except cartesia.CartesiaError:
+                data = {}
+            if data and not self._is_inbound(data):
+                return None
+            caller = inbound.caller_from_call(data) or caller
+        return self.inbound_call(agent_call_id, caller, via="lookup_caller")
+
+    async def lookup_caller_tool(self, payload: dict) -> str:
+        """lookup_caller (already authenticated): who is calling, for the AI."""
+        call = await self._call_for_tool(payload)
+        if call is None:
+            return "known: no\ndo_not_contact: no\nnote: A new caller."  # e.g. a Playground test
+        caller = inbound.normalize(str(payload.get("caller") or ""))
+        if caller and not call.lead_id and caller != call.number:  # the tool's number is the surest
+            call = self._relink_caller(call, caller)
+        text = inbound.lookup_text(call)
+        _debug(call.id, "lookup_caller", "Known lead" if call.lead_id else "New caller", result=text)
+        return text
+
+    def _relink_caller(self, call: Call, phone: str) -> Call:
+        lead = leads.find_by_phone(phone)
+        with get_session() as s:
+            row = s.get(Call, call.id)
+            row.number = phone
+            row.lead_id = lead.id if lead else row.lead_id
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+        _publish_call(row)
+        if lead:
+            leads.on_inbound_call(row)
+        return row
+
+    async def save_caller_tool(self, payload: dict) -> str:
+        """save_caller (already authenticated): a new caller's details -> a lead linked to this call."""
+        call = await self._call_for_tool(payload)
+        if call is None or call.status in FINAL:
+            return "Noted."
+        reply, lead_id = inbound.save_caller(call, payload)
+        if lead_id and lead_id != call.lead_id:
+            with get_session() as s:
+                row = s.get(Call, call.id)
+                row.lead_id = lead_id
+                s.add(row)
+                s.commit()
+                s.refresh(row)
+            _publish_call(row)
+            leads.on_inbound_call(row)
+        _debug(call.id, "save_caller", reply, lead_id=lead_id,
+               **{k: str(payload.get(k) or "")[:120] or None for k in ("name", "business_name", "service", "location")})
+        return reply
+
+    def _inbound_lead_at_end(self, call: Call) -> Call:
+        """An inbound caller who never got saved (save_caller) but wants something from us: a lead, so the
+        callback / follow-up has someone to go to."""
+        if call.direction != "inbound" or call.lead_id or call.outcome not in ("interested", *outcomes.CALLBACK_OUTCOMES):
+            return call
+        phone = inbound.normalize(call.number)
+        if not phone:
+            return call
+        lead = leads.find_by_phone(phone) or leads.create_inbound_lead(phone, {"note": call.outcome_note}, call.id)
+        with get_session() as s:
+            row = s.get(Call, call.id)
+            row.lead_id = lead.id
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+        leads.on_inbound_call(row)
+        return row
 
     async def recording(self, call_id: int) -> tuple[bytes, str] | None:
         """The call's recording (WAV from Cartesia), cached in data/recordings/."""

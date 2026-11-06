@@ -65,7 +65,10 @@ def login(c, name, pw=None):
 
 
 ADMIN_ONLY = [("post", "/api/dialer/on", None), ("post", "/api/dialer/off", None), ("post", "/api/calls", {"number": "+15125550100"}),
-              ("post", "/api/calls/1/hangup", None), ("put", "/api/supervisor", {"phone": "+15125550100"}),
+              ("post", "/api/calls/1/hangup", None), ("put", "/api/supervisor", {"phone": "+15125550100"}), ("put", "/api/supervisor/people/x", {"phone": "bad"}),
+              ("put", "/api/sheets", {"sync_minutes": 1}),
+              ("post", "/api/sheets/sync", None), ("post", "/api/sheets/results/rewrite", None),
+              ("post", "/api/leads/999/sales-handled", {"handled": False}),
               ("put", "/api/settings", {"values": {}, "version": ""}), ("put", "/api/voice", {"voice": {}, "version": ""}),
               ("post", "/api/voice/sounds?filename=x.mp3", None),
               ("post", "/api/leads/1/dnc", {"dnc": True}), ("post", "/api/dnc", {"phone": "+15125550100"}),
@@ -86,7 +89,9 @@ with TestClient(app) as c:
     assert c.get("/api/auth/me", headers=sup).json()["role"] == "supervisor"
     for path in ("/api/leads", "/api/calls", "/api/health", "/api/supervisor", "/api/supervisor/requests", "/api/dialer", "/api/settings"):
         assert c.get(path, headers=sup).status_code == 200, path
-    assert c.post("/api/supervisor/availability", headers=sup, json={"available": True}).json()["available"] is True
+    c.put("/api/supervisor/people/sup", json={"phone": "+15125550100"})  # this computer = admin: put "sup" on the list
+    st = c.post("/api/supervisor/availability", headers=sup, json={"available": True}).json()
+    assert next(p for p in st["people"] if p["key"] == "sup")["available"] is True, st
     assert c.post("/api/supervisor/requests/999/answer", headers=sup, json={"accept": True}).status_code == 409  # allowed, no such request
     for method, path, body in ADMIN_ONLY:
         r = getattr(c, method)(path, headers=sup, json=body)

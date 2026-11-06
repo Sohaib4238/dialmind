@@ -164,7 +164,7 @@ try:
         c.post("/api/dialer/on")
         s = wait_state(c, lambda s: s["state"] == "off")
         print("5.", s["state"], "|", s["reason"])
-        assert "free Cartesia minutes" in s["reason"] and fake.dialed == []
+        assert "Cartesia minutes left" in s["reason"] and fake.dialed == []
         health.minutes_left = real
 
         # 6) never two calls at once: a manual call is live -> the dialer waits

@@ -127,28 +127,32 @@ assert not supervisor.in_hours(h, datetime(2026, 11, 2, 2, 0, tzinfo=utc))  # Mo
 he = {"enabled": True, "timezone": "America/New_York", "start": "09:00", "end": "17:00", "days": ["mon"]}
 assert supervisor.in_hours(he, datetime(2026, 11, 2, 14, 0, tzinfo=utc)) and not supervisor.in_hours(he, datetime(2026, 11, 2, 23, 0, tzinfo=utc))
 for bad in ({"phone": "555"}, {"wait_seconds": 500}, {"hours": {"timezone": "Europe/London"}}, {"hours": {"start": "9am"}},
-            {"hours": {"start": "10:00", "end": "10:00"}}, {"hours": {"enabled": True, "days": []}}):
+            {"hours": {"start": "10:00", "end": "10:00"}}, {"hours": {"enabled": True, "days": []}}, {"key": "bad name"}):
     try:
-        supervisor.validate(bad)
+        supervisor.save_wait(bad["wait_seconds"]) if "wait_seconds" in bad else supervisor.save_person("supervisor", bad)
         raise AssertionError(f"accepted {bad}")
     except supervisor.SupervisorError:
         pass
+assert not os.path.exists(SUP)  # nothing invalid was ever written
 print("settings: validation OK; working hours incl. an overnight shift OK")
 
 with TestClient(app) as c:
     st = c.get("/api/supervisor").json()
-    assert st["phone"] == os.environ["TEST_CALL_NUMBER"] and st["available"] is False and st["wait_seconds"] == 20
+    p0 = st["people"][0]
+    assert len(st["people"]) == 1 and p0["key"] == "supervisor", st  # no file yet: one supervisor, as before
+    assert p0["phone"] == os.environ["TEST_CALL_NUMBER"] and p0["available"] is False and st["wait_seconds"] == 20
     assert st["can_take_calls"] is False and "unavailable" in st["why_not"]
-    assert c.put("/api/supervisor", json={"phone": "12"}).status_code == 400
-    st = c.put("/api/supervisor", json={"phone": "+1 (786) 555-0100", "available": True, "wait_seconds": 15}).json()
-    assert st["phone"] == "+17865550100" and st["can_take_calls"] is True, st
+    assert c.put("/api/supervisor/people/supervisor", json={"phone": "12"}).status_code == 400
+    st = c.put("/api/supervisor/people/supervisor", json={"phone": "+1 (786) 555-0100", "available": True}).json()
+    assert c.put("/api/supervisor", json={"wait_seconds": 15}).json()["wait_seconds"] == 15
+    assert st["people"][0]["phone"] == "+17865550100" and st["can_take_calls"] is True, st
     print("settings API: defaults (off, test number, 20 s), phone cleaned up, bad input refused")
 
     # ---- 2. tool auth + unknown call ------------------------------------------------------------------
     assert c.post("/api/cartesia/tools/request_supervisor", json={"call_id": "x"}).status_code == 401
     assert c.post("/api/cartesia/tools/request_supervisor", json={"call_id": "x"},
                   headers={"Authorization": "Bearer nope"}).status_code == 401
-    assert tool(c, "ac_unknown").text.startswith("NOT AVAILABLE")
+    assert tool(c, "ac_unknown").json()["answer"] == "NOT AVAILABLE"
     assert c.post("/api/cartesia/tools/request_supervisor", headers={"cf-ray": "1", **AUTH},
                   json={"call_id": "ac_unknown"}).status_code == 200  # reachable through the tunnel
     print("tool: 401 without / wrong secret; unknown call -> NOT AVAILABLE; public through the tunnel")
@@ -165,7 +169,8 @@ with TestClient(app) as c:
     wait(lambda: any(e["kind"] == "transcript" for e in c.get(f"/api/calls/{cid}").json()["events"]))
     t0 = time.time()
     r = tool(c, room)
-    assert r.text.startswith("WAITING") and 0.5 <= time.time() - t0 < 2, (r.text, time.time() - t0)
+    assert r.json()["answer"] == "WAITING" and 0.5 <= time.time() - t0 < 2, (r.text, time.time() - t0)
+    assert "transfer_number" not in r.json() and r.headers["content-type"].startswith("application/json")
     reqs = c.get("/api/supervisor/requests").json()
     assert len(reqs) == 1 and reqs[0]["call_id"] == cid and reqs[0]["status"] == "waiting", reqs
     p = reqs[0]
@@ -185,10 +190,12 @@ with TestClient(app) as c:
     a = c.post(f"/api/supervisor/requests/{cid}/answer", json={"accept": True})
     th.join()
     assert a.status_code == 200 and a.json()["status"] == "accepted", a.text
-    assert out["r"].text.startswith("AVAILABLE") and out["t"] - t_click < 1.0, (out["r"].text, out["t"] - t_click)
+    assert out["r"].json()["answer"] == "AVAILABLE" and out["t"] - t_click < 1.0, (out["r"].text, out["t"] - t_click)
+    assert out["r"].json()["transfer_number"] == "+17865550100"  # Cartesia saves it into {{transfer_number}}
+    assert row(Call, cid).transfer_to == "supervisor" and row(Call, cid).transfer_offered == ["supervisor"]
     supervisor.CHECK_WAIT_S = 0.6
     assert c.post(f"/api/supervisor/requests/{cid}/answer", json={"accept": False}).status_code == 409  # already answered
-    assert tool(c, room).text.startswith("AVAILABLE")  # asking again: same answer
+    assert tool(c, room).json()["answer"] == "AVAILABLE"  # asking again: same answer
     assert c.get("/api/supervisor/requests").json() == []
     transfer_turn(room, 20)
     wait(lambda: row(Call, cid).transfer_status == "transferring")
@@ -211,9 +218,9 @@ with TestClient(app) as c:
     lid = new_lead("Busy Bob", "+15125550202")
     call = c.post(f"/api/leads/{lid}/call").json()
     cid, room = call["id"], call["room"]
-    assert tool(c, room).text.startswith("WAITING")
+    assert tool(c, room).json()["answer"] == "WAITING"
     assert c.post(f"/api/supervisor/requests/{cid}/answer", json={"accept": False}).status_code == 200
-    assert tool(c, room).text.startswith("NOT AVAILABLE")
+    assert tool(c, room).json()["answer"] == "NOT AVAILABLE"
     day = date.today() + timedelta(days=1)
     r = c.post("/api/cartesia/tools/record_outcome", headers=AUTH, json={
         "call_id": room, "outcome": "interested", "note": "wants a call from the manager", "callback_time": f"{day}T11:00"})
@@ -231,9 +238,9 @@ with TestClient(app) as c:
     lid = new_lead("Slow Sam", "+15125550203")
     call = c.post(f"/api/leads/{lid}/call").json()
     cid, room = call["id"], call["room"]
-    assert tool(c, room).text.startswith("WAITING")
-    replies = [tool(c, room).text for _ in range(5)]
-    assert replies[-1].startswith("NOT AVAILABLE"), replies
+    assert tool(c, room).json()["answer"] == "WAITING"
+    replies = [tool(c, room).json()["answer"] for _ in range(5)]
+    assert replies[-1] == "NOT AVAILABLE", replies
     assert row(Call, cid).transfer_status == "timeout" and "2s" in row(Call, cid).transfer_note
     assert c.post(f"/api/supervisor/requests/{cid}/answer", json={"accept": True}).status_code == 409
     fake.finish(room)
@@ -265,7 +272,7 @@ with TestClient(app) as c:
     cid, room = call["id"], call["room"]
     assert fake.vars[-1]["supervisor_status"] == "unavailable" and row(Call, cid).transfer_status == "unavailable"
     t0 = time.time()
-    assert tool(c, room).text.startswith("NOT AVAILABLE") and time.time() - t0 < 0.3  # no waiting, no pop-up
+    assert tool(c, room).json()["answer"] == "NOT AVAILABLE" and time.time() - t0 < 0.3  # no waiting, no pop-up
     assert c.get("/api/supervisor/requests").json() == []
     c.post("/api/cartesia/tools/record_outcome", headers=AUTH, json={"call_id": room, "outcome": "interested", "note": ""})
     fake.finish(room)

@@ -1,4 +1,4 @@
-import type { AppConfig, AuthMe, BackgroundSound, Call, CallEvent, DialerState, Email, EmailState, Health, ImportPreview, Lead, LeadCounts, LeadDetail, LeadsList, SaveResult, SettingsPayload, Sms, SmsState, SupervisorRequest, SupervisorSettings, VoiceList, VoicePayload, VoiceSettings } from "./types"
+import type { AppConfig, AuthMe, BackgroundSound, Call, CallEvent, DialerOrder, DialerState, Email, EmailState, Health, ImportPreview, Lead, LeadCounts, LeadDetail, LeadsList, SaveResult, SettingsPayload, SheetSettings, SheetsStatus, SheetSyncSummary, Sms, SmsState, SupervisorHours, SupervisorRequest, SupervisorSettings, VoiceList, VoicePayload, VoiceSettings } from "./types"
 
 /** True when the dashboard is opened from another computer (through the dashboard tunnel). */
 export const IS_REMOTE =
@@ -59,13 +59,28 @@ export const api = {
     request<{ ok: boolean; user: string }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   supervisor: () => request<SupervisorSettings>("/api/supervisor"),
-  saveSupervisor: (values: Partial<Pick<SupervisorSettings, "phone" | "available" | "wait_seconds" | "hours">>) =>
-    request<SupervisorSettings>("/api/supervisor", { method: "PUT", body: JSON.stringify(values) }),
-  setAvailable: (available: boolean) =>
-    request<SupervisorSettings>("/api/supervisor/availability", { method: "POST", body: JSON.stringify({ available }) }),
+  saveSupervisorWait: (wait_seconds: number) =>
+    request<SupervisorSettings>("/api/supervisor", { method: "PUT", body: JSON.stringify({ wait_seconds }) }),
+  saveSupervisorPerson: (key: string, values: { key?: string; name?: string; phone?: string; available?: boolean; hours?: SupervisorHours }) =>
+    request<SupervisorSettings>(`/api/supervisor/people/${encodeURIComponent(key)}`, { method: "PUT", body: JSON.stringify(values) }),
+  removeSupervisorPerson: (key: string) =>
+    request<SupervisorSettings>(`/api/supervisor/people/${encodeURIComponent(key)}`, { method: "DELETE" }),
+  /** Your own switch; an admin (or this computer) may pass whose. */
+  setAvailable: (available: boolean, key?: string) =>
+    request<SupervisorSettings>("/api/supervisor/availability", { method: "POST", body: JSON.stringify({ available, key }) }),
   supervisorRequests: () => request<SupervisorRequest[]>("/api/supervisor/requests"),
-  answerRequest: (callId: number, accept: boolean) =>
-    request<SupervisorRequest>(`/api/supervisor/requests/${callId}/answer`, { method: "POST", body: JSON.stringify({ accept }) }),
+  answerRequest: (callId: number, accept: boolean, supervisor?: string) =>
+    request<SupervisorRequest>(`/api/supervisor/requests/${callId}/answer`, { method: "POST", body: JSON.stringify({ accept, supervisor }) }),
+  sheets: () => request<SheetsStatus>("/api/sheets"),
+  saveSheets: (values: Partial<SheetSettings>) =>
+    request<SheetsStatus>("/api/sheets", { method: "PUT", body: JSON.stringify(values) }),
+  syncSheets: () => request<SheetSyncSummary>("/api/sheets/sync", { method: "POST" }),
+  recheckColors: () => request<SheetSyncSummary>("/api/sheets/recheck-colors", { method: "POST" }),
+  setDialerOrder: (order: DialerOrder) =>
+    request<DialerState>("/api/dialer/order", { method: "POST", body: JSON.stringify({ order }) }),
+  rewriteResults: () => request<{ ok: boolean; queued: number }>("/api/sheets/results/rewrite", { method: "POST" }),
+  setSalesHandled: (id: number, handled: boolean) =>
+    request<Lead>(`/api/leads/${id}/sales-handled`, { method: "POST", body: JSON.stringify({ handled }) }),
   simulate: (number: string) =>
     request<Call>("/api/dev/simulate", { method: "POST", body: JSON.stringify({ number }) }),
   health: () => request<Health>("/api/health"),
@@ -76,8 +91,8 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ values, version }),
     }),
-  leads: (params: { q?: string; status?: string } = {}) => {
-    const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v) as [string, string][]).toString()
+  leads: (params: { q?: string; status?: string; sort?: "sheet" | "recent"; limit?: number } = {}) => {
+    const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v).map(([k, v]) => [k, String(v)])).toString()
     return request<LeadsList>(`/api/leads${qs ? `?${qs}` : ""}`)
   },
   lead: (id: number) => request<LeadDetail>(`/api/leads/${id}`),

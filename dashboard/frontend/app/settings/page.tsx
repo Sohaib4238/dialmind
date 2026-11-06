@@ -13,7 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, ApiError } from "@/lib/api"
-import type { FieldSpec, SettingsPayload, SyncStatus } from "@/lib/types"
+import { formatPhone } from "@/lib/format"
+import type { FieldSpec, InboundStatus, SettingsPayload, SyncStatus } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 type Values = Record<string, unknown>
@@ -51,6 +52,7 @@ export default function SettingsPage() {
   const [errors, setErrors] = useState<Errors>({})
   const [saving, setSaving] = useState(false)
   const [sync, setSync] = useState<SyncStatus | null>(null)
+  const [inbound, setInbound] = useState<InboundStatus | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -59,6 +61,7 @@ export default function SettingsPage() {
       setValues(d.values)
       setErrors({})
       setSync(d.sync ?? null)
+      setInbound(d.inbound ?? null)
       if (d.file_error) toast.error("The settings file on disk is invalid", { description: d.file_error })
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : "Couldn't load settings")
@@ -79,6 +82,7 @@ export default function SettingsPage() {
       setData({ ...data, values, version: res.version })
       setErrors({})
       const st = syncFromSave(res.cartesia)
+      if (res.inbound) setInbound(res.inbound)
       setSync(st)
       if (st.in_sync) toast.success("Saved · Synced to Cartesia ✓", { description: `Applies to the next call. Backup: ${res.backup}` })
       else toast.warning("Saved, but not synced to Cartesia", { description: st.detail, duration: 10000 })
@@ -182,6 +186,9 @@ export default function SettingsPage() {
                 )}
               >
                 {f.label}
+                {f.key === "voicemail" && (
+                  <span className={cn("text-[10px] font-medium", vmOn(data.values) ? "text-signal" : "text-faint")}>{vmOn(data.values) ? "ON" : "OFF"}</span>
+                )}
                 {f.coming_soon && <span className="size-1 rounded-full bg-faint" title="Coming soon" />}
               </a>
             ))}
@@ -190,7 +197,9 @@ export default function SettingsPage() {
           <div className="space-y-4">
             {data.fields.map((f) => (
               <Panel key={f.path} id={`section-${f.path}`} className="scroll-mt-8 p-4">
+                {f.key === "voicemail" && <VoicemailLine saved={vmOn(data.values)} now={vmOn(values)} />}
                 <Field spec={f} path={[f.key]} values={values} errors={errors} onChange={update} top />
+                {f.key === "inbound" && <InboundLine status={inbound} />}
               </Panel>
             ))}
             <p className="pt-2 text-[12px] text-faint">
@@ -198,17 +207,53 @@ export default function SettingsPage() {
                 <code key={p} className="mr-1 font-mono text-muted-foreground">{`{${p}}`}</code>
               ))}
               . Lead details, different on every call and sometimes empty:{" "}
-              {["lead_name", "business_name", "service_required", "business_description", "job_description", "location"].map((p) => (
+              {["lead_name", "business_name", "service_required", "business_description", "job_description", "location", "lead_source"].map((p) => (
                 <code key={p} className="mr-1 font-mono text-muted-foreground">{`{${p}}`}</code>
               ))}
               . <code className="mr-1 font-mono text-muted-foreground">{"{specialist_title}"}</code> is who we hand
               the lead to, from their service (like &quot;our senior web designer&quot;, see Who the lead is handed to).
+              {" "}<code className="mr-1 font-mono text-muted-foreground">{"{source_line}"}</code> (opening line only) is the
+              sentence about where the lead came from; parts in [square brackets] are left out when a detail in them is empty.
               Every save keeps a backup in config/backups.
             </p>
           </div>
         </div>
       )}
     </>
+  )
+}
+
+function vmOn(v: Values | null | undefined): boolean {
+  return (v as { voicemail?: { leave_message?: unknown } } | null)?.voicemail?.leave_message === true
+}
+
+/** Voicemail messages: what the saved (live) setting does, and whether an unsaved change is waiting. */
+function VoicemailLine({ saved, now }: { saved: boolean; now: boolean }) {
+  return (
+    <div className={cn("mb-4 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-[12px]",
+      saved ? "border-signal/30 bg-signal-soft text-foreground" : "border-border bg-surface-2 text-muted-foreground")}>
+      <Tag tone={saved ? "signal" : "neutral"}>{saved ? "Voicemail messages ON" : "Voicemail messages OFF"}</Tag>
+      <span>
+        {saved
+          ? "On a voicemail the AI waits for the beep, leaves the message below, then hangs up."
+          : "On a voicemail the AI hangs up at once and leaves no message (saves minutes)."}
+      </span>
+      {saved !== now && <span className="font-medium text-warning">Not saved yet: Save to turn it {now ? "on" : "off"}.</span>}
+    </div>
+  )
+}
+
+/** Does Cartesia answer our number right now? (After a save: what switching on/off did.) */
+function InboundLine({ status }: { status: InboundStatus | null }) {
+  if (!status) return null
+  const tone = status.state === "on" ? "signal" : status.state === "error" ? "danger" : "neutral"
+  const label = { on: "Answering", off: "Off", pending: "Waiting", error: "Problem", standby: "Standby", unknown: "Checking" }[status.state]
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border pt-3 text-[12px] text-muted-foreground">
+      <Tag tone={tone}>{label}</Tag>
+      <span>{status.detail}</span>
+      {status.number && status.state !== "on" && <span className="font-mono text-faint tnum">{formatPhone(status.number)}</span>}
+    </div>
   )
 }
 

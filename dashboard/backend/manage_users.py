@@ -2,6 +2,8 @@
 
     python manage_users.py set NAME --role admin        # create, or reset the password / role (asks for the password)
     python manage_users.py set NAME --role supervisor
+    python manage_users.py set NAME --role supervisor --phone +1XXXXXXXXXX --display "Sara"   # + on the supervisor list
+    python manage_users.py phone NAME +1XXXXXXXXXX [--display "Sara"]   # a supervisor's transfer phone, no password asked
     python manage_users.py list
     python manage_users.py remove NAME
 
@@ -45,6 +47,21 @@ def cmd_set(name: str, role: str, from_stdin: bool) -> None:
     print(f"{action} '{name}' ({role}). Their old sessions are logged out.")
 
 
+def cmd_supervisor(name: str, phone: str | None, display: str | None) -> None:
+    """Put this login on the supervisor list (data/supervisor.json) with their own transfer phone. They start
+    switched off ("available" is theirs to flip on the dashboard)."""
+    from app import supervisor
+
+    values = {k: v for k, v in (("phone", phone), ("name", display)) if v is not None}
+    try:
+        state = supervisor.save_person(name, values)
+    except supervisor.SupervisorError as e:
+        sys.exit(f"Supervisor list not changed: {e}")
+    p = next(x for x in state["people"] if x["key"] == name)
+    print(f"Supervisor '{name}' ({p['name']}): transfers go to {p['phone'] or '(no phone yet)'}; "
+          f"available: {'on' if p['available'] else 'off'} (they switch it on in the dashboard).")
+
+
 def cmd_list() -> None:
     found = auth.users()
     if not found:
@@ -73,12 +90,32 @@ def main() -> None:
     s.add_argument("name")
     s.add_argument("--role", required=True, choices=auth.ROLES)
     s.add_argument("--password-stdin", action="store_true", help="read the password from standard input")
+    s.add_argument("--phone", help="supervisor: their own transfer phone (+1XXXXXXXXXX); adds them to the supervisor list")
+    s.add_argument("--display", help="supervisor: the name shown on the pop-up and in History")
+    ph = sub.add_parser("phone", help="set a supervisor's transfer phone (adds them to the supervisor list)")
+    ph.add_argument("name")
+    ph.add_argument("phone")
+    ph.add_argument("--display")
     sub.add_parser("list", help="show users and roles")
     r = sub.add_parser("remove", help="remove a user")
     r.add_argument("name")
     a = p.parse_args()
+    try:  # an old one-supervisor file is linked to the only supervisor login: do it BEFORE logins change
+        from app import supervisor
+
+        supervisor.load()
+    except Exception:  # noqa: BLE001 - never block a login change
+        pass
     if a.command == "set":
+        if (a.phone or a.display) and not NAME.match(a.name):
+            sys.exit("Use letters, numbers, dots, dashes and underscores for the name. Nothing changed.")
         cmd_set(a.name, a.role, a.password_stdin)
+        if a.phone or a.display:
+            cmd_supervisor(a.name, a.phone, a.display)
+    elif a.command == "phone":
+        if a.name not in auth.users():
+            sys.exit(f"No login '{a.name}' yet: create it first with set {a.name} --role supervisor.")
+        cmd_supervisor(a.name, a.phone, a.display)
     elif a.command == "list":
         cmd_list()
     else:

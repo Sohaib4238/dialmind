@@ -80,11 +80,12 @@ with TestClient(app) as c:
     assert c.get("/api/supervisor", headers=hdr).status_code == 200
     assert c.get("/api/supervisor/requests", headers=hdr).status_code == 200
     # allowed writes: availability + answering the pop-up
-    assert c.post("/api/supervisor/availability", headers=hdr, json={"available": True}).json()["available"] is True
+    st = c.post("/api/supervisor/availability", headers=hdr, json={"available": True}).json()
+    assert next(p for p in st["people"] if p["key"] == "supervisor")["available"] is True, st  # their own switch
     assert c.post("/api/supervisor/requests/999/answer", headers=hdr, json={"accept": True}).status_code == 409  # no such open request
     # everything else that changes something stays on the main computer
     for method, path, body in (("post", "/api/dialer/on", None), ("post", "/api/calls", {"number": "+15125550100"}),
-                               ("put", "/api/supervisor", {"phone": "+15125550100"}), ("put", "/api/settings", {"values": {}, "version": ""}),
+                               ("put", "/api/supervisor", {"wait_seconds": 20}), ("put", "/api/supervisor/people/x", {"phone": "+15125550100"}), ("put", "/api/settings", {"values": {}, "version": ""}),
                                ("post", "/api/leads/1/dnc", {"dnc": True}), ("post", "/api/dev/simulate", {"number": "+1"}),
                                ("post", "/api/voice/sample", {"voice_id": "x"})):
         r = getattr(c, method)(path, headers=hdr, json=body)

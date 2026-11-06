@@ -1,14 +1,15 @@
 """Auto-dialer: calls leads one at a time while it's ON (Leads page switch).
 
-Order: status "new" first (oldest import first), then retries that are due (oldest last call
-first). Never calls a Do-Not-Contact lead or one that's already being called. A lead is only
+Order: callbacks that are due, then status "new" (sheet order: top to bottom, first tab first; or newest
+first: the dialer_order setting, sheet_sync.queue_order), then retries that are due (oldest last call
+first). Never calls a Do-Not-Contact lead, a lead handled by sales, or one that's already being called. A lead is only
 called inside calling hours in its own time zone (zip / state in its location, else the area
 code; unknown -> skipped).
 
 Safety:
 - Always starts OFF (also after a backend restart); stops after max_calls_per_session.
 - Pauses after pause_after_failures failed calls in a row, and stops when the estimated free
-  Cartesia minutes left drop below min_free_minutes.
+  Cartesia minutes left this month (plan dollars / agent rate) drop below min_free_minutes.
 - TEST MODE (default ON, app/test_mode.py): the dialer walks the real leads list (statuses/history
   update on the real lead) but every call dials TEST_CALL_NUMBER. It's enforced for every call in
   CallManager.start_call and cartesia.create_call, not here.
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta
 
 from sqlmodel import select
 
-from app import health, test_mode
+from app import health, sheet_sync, test_mode
 from app.area_codes import zone
 from app.timezones import lead_timezone
 from app.bus import bus
@@ -68,10 +69,11 @@ def pick_next(now_utc: datetime | None = None) -> tuple[Lead | None, dict]:
         return not x.last_call_at or now_utc - as_utc(x.last_call_at) >= gap
 
     with get_session() as db:
-        leads = db.exec(select(Lead).where(Lead.dnc == False)).all()  # noqa: E712
+        # never DNC, never a lead the sales team has (green/yellow row in their sheet)
+        leads = db.exec(select(Lead).where(Lead.dnc == False, Lead.sales_handled == False)).all()  # noqa: E712
     callbacks = [x for x in leads if x.status == "callback" and x.callback_at]
     cb_due = sorted((x for x in callbacks if as_utc(x.callback_at) <= now_utc), key=lambda x: as_utc(x.callback_at))
-    new = sorted((x for x in leads if x.status == "new"), key=lambda x: (x.created_at, x.id))
+    new = sheet_sync.queue_order([x for x in leads if x.status == "new"])
     retry_ok = [x for x in leads if x.status in d.retry_statuses and x.attempts < 1 + d.max_retries]
     # voicemail: up to voicemail_retries more tries, each at another time of day than the last one
     vm_ok = [x for x in leads if x.status == "voicemail" and x.vm_count <= d.voicemail_retries]
@@ -152,6 +154,8 @@ class AutoDialer:
             "wait_detail": self.wait_detail,
             "minutes_left": health.minutes_left(),
             "limits": limits,
+            "order": sheet_sync.load()["dialer_order"],
+            "orders": sheet_sync.DIALER_ORDERS,
             "log": list(self.log)[-60:],
         }
 
@@ -212,9 +216,10 @@ class AutoDialer:
             if self.session_calls >= d.max_calls_per_session:
                 self.turn_off(f"Reached max calls this session ({d.max_calls_per_session})")
                 break
+            await health.refresh_usage()  # Cartesia's real usage when there's an admin key (at most every 5 min)
             left = health.minutes_left()
             if left < d.min_free_minutes:
-                self.turn_off(f"Only ~{left} free Cartesia minutes left (stops below {d.min_free_minutes})")
+                self.turn_off(f"Only ~{left} Cartesia minutes left this month (stops below {d.min_free_minutes})")
                 break
             lead, info = pick_next()
             if lead is None:

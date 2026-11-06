@@ -11,6 +11,7 @@ import { useIsAdmin } from "@/components/login-gate"
 import { Switch } from "@/components/switch"
 import { api, ApiError, IS_REMOTE } from "@/lib/api"
 import { useLiveStatus, useLiveStream } from "@/lib/live"
+import type { SupervisorSettings } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const NAV = [
@@ -156,36 +157,35 @@ function StatusLine({ ok, label }: { ok: boolean | null | "warn"; label: string 
   )
 }
 
-/** "Available for transfers": the supervisor flips it from any screen (also remotely). */
+/** "Available for transfers": each supervisor flips their own, from any screen (also remotely). On this computer
+ * (no login) with one supervisor, it's theirs. Hidden for anyone else (an admin uses the Supervisor page). */
 function AvailabilitySwitch() {
-  const [on, setOn] = useState<boolean | null>(null)
-  const [why, setWhy] = useState("")
+  const [s, setS] = useState<SupervisorSettings | null>(null)
   useEffect(() => {
-    api.supervisor().then((s) => { setOn(s.available); setWhy(s.can_take_calls ? "" : s.why_not) }).catch(() => {})
+    api.supervisor().then(setS).catch(() => {})
   }, [])
   useLiveStream((msg) => {
-    if (msg.type === "supervisor_settings") {
-      setOn(msg.settings.available)
-      setWhy(msg.settings.can_take_calls ? "" : msg.settings.why_not)
-    }
+    if (msg.type === "supervisor_settings") setS((prev) => (prev ? { ...prev, ...msg.settings } : prev))
   })
+  const key = s?.me_supervisor ? s.me : !IS_REMOTE && s?.people.length === 1 ? s.people[0].key : null
+  const p = s?.people.find((x) => x.key === key)
+  if (!s || !p) return null
   const flip = async (v: boolean) => {
-    setOn(v)
+    setS({ ...s, people: s.people.map((x) => (x.key === p.key ? { ...x, available: v } : x)) })
     try {
-      const s = await api.setAvailable(v)
-      setWhy(s.can_take_calls ? "" : s.why_not)
+      setS({ ...s, ...(await api.setAvailable(v, s.me_supervisor ? undefined : p.key)) })
     } catch (e) {
-      setOn(!v)
+      setS(s)
       toast.error(e instanceof ApiError ? e.message : "Couldn't change availability")
     }
   }
   return (
     <div className="space-y-1">
       <label className="flex items-center justify-between gap-3 text-[12px] text-muted-foreground">
-        Supervisor available
-        <Switch small on={!!on} disabled={on == null} onChange={flip} label="Supervisor available for transfers" />
+        {s.me_supervisor ? "I'm available" : `${p.name} available`}
+        <Switch small on={p.available} onChange={flip} label="Available for transfers" />
       </label>
-      {on && why && <p className="text-[11px] leading-4 text-warning">{why}</p>}
+      {p.available && !p.can_take_calls && p.why_not && <p className="text-[11px] leading-4 text-warning">{p.why_not}</p>}
     </div>
   )
 }

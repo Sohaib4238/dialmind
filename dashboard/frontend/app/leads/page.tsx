@@ -8,6 +8,7 @@ import { toast } from "sonner"
 
 import { EmptyState, PageHeader, Panel, PanelHeader, SkeletonLine } from "@/components/common"
 import { DialerPanel } from "@/components/dialer-panel"
+import { SheetSyncPanel } from "@/components/sheet-sync-panel"
 import { formatInZone } from "@/components/outcome"
 import { LEAD_STATUS_LABEL, LEAD_STATUSES, LeadStatusTag, RARE_STATUSES } from "@/components/lead-status"
 import { useIsAdmin } from "@/components/login-gate"
@@ -22,7 +23,13 @@ import { cn } from "@/lib/utils"
 
 const ALL = "__all__"
 const EASE = [0.22, 1, 0.36, 1] as const
-const COLS = "grid grid-cols-[minmax(180px,1.4fr)_150px_minmax(120px,1fr)_minmax(100px,0.8fr)_150px_64px_110px_84px] items-center gap-4"
+const COLS = "grid grid-cols-[72px_minmax(180px,1.4fr)_150px_minmax(120px,1fr)_minmax(100px,0.8fr)_170px_64px_110px_84px] items-center gap-4"
+const LIMIT = 2000
+const SORTS = { sheet: "Sheet order", recent: "Recent activity" } as const
+type Sort = keyof typeof SORTS
+
+/** "(Sales) leads" -> "Sales"; a tab name without brackets, like "Tab A", stays as it is */
+const tabLabel = (tab: string) => tab.match(/\(([^)]+)\)/)?.[1] ?? tab
 
 const TILES: { key: string; label: string; status?: LeadStatus }[] = [
   { key: "total", label: "Total" },
@@ -41,6 +48,7 @@ export default function LeadsPage() {
   const [total, setTotal] = useState(0)
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState<string>(ALL)
+  const [sort, setSort] = useState<Sort>("sheet")
   const [panel, setPanel] = useState<"none" | "import" | "dnc">("none")
   const [busyId, setBusyId] = useState<number | null>(null)
   const reqId = useRef(0)
@@ -48,7 +56,7 @@ export default function LeadsPage() {
   const load = useCallback(async () => {
     const id = ++reqId.current
     try {
-      const d = await api.leads({ q: query.trim(), status: status === ALL ? "" : status })
+      const d = await api.leads({ q: query.trim(), status: status === ALL ? "" : status, sort, limit: LIMIT })
       if (id !== reqId.current) return // a newer search is in flight
       setLeads(d.leads)
       setCounts(d.counts)
@@ -59,7 +67,7 @@ export default function LeadsPage() {
         toast.error(e instanceof ApiError ? e.message : "Couldn't load leads")
       }
     }
-  }, [query, status])
+  }, [query, status, sort])
 
   useEffect(() => {
     const t = setTimeout(load, query ? 200 : 0) // debounce typing
@@ -131,6 +139,8 @@ export default function LeadsPage() {
 
       <DialerPanel />
 
+      <SheetSyncPanel admin={admin} />
+
       {/* Counters */}
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {TILES.map((t) => {
@@ -185,18 +195,29 @@ export default function LeadsPage() {
               ))}
             </SelectContent>
           </Select>
+          <Select value={sort} onValueChange={(x) => setSort(x as Sort)}>
+            <SelectTrigger className="w-44" aria-label="Sort">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(SORTS) as Sort[]).map((k) => <SelectItem key={k} value={k}>{SORTS[k]}</SelectItem>)}
+            </SelectContent>
+          </Select>
           {(query || status !== ALL) && (
             <Button variant="ghost" size="sm" onClick={() => { setQuery(""); setStatus(ALL) }}>
               <X strokeWidth={1.5} />
               Clear
             </Button>
           )}
-          <span className="ml-auto text-[12px] text-faint tnum">{leads ? `${total} lead${total === 1 ? "" : "s"}` : ""}</span>
+          <span className="ml-auto text-[12px] text-faint tnum">
+            {leads ? (leads.length < total ? `Showing ${leads.length} of ${total} leads` : `${total} lead${total === 1 ? "" : "s"}`) : ""}
+          </span>
         </div>
 
         <div className="overflow-x-auto">
-          <div className="min-w-[1080px]">
+          <div className="min-w-[1160px]">
             <div className={`${COLS} h-10 border-b border-border px-4 text-[12px] text-faint`}>
+              <span title="The sales sheet's tab and row">Sheet</span>
               <span>Lead</span>
               <span>Phone</span>
               <span>Service</span>
@@ -210,6 +231,7 @@ export default function LeadsPage() {
               <div className="divide-y divide-border">
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className={`${COLS} h-12 px-4`}>
+                    <SkeletonLine className="w-12" />
                     <SkeletonLine className="w-40" />
                     <SkeletonLine className="w-28" />
                     <SkeletonLine className="w-24" />
@@ -237,9 +259,16 @@ export default function LeadsPage() {
                       transition={{ duration: 0.18, delay: Math.min(i, 12) * 0.012 }}
                       className={`${COLS} group h-12 cursor-pointer px-4 text-[13px] transition-colors duration-[120ms] hover:bg-surface-2`}
                       onClick={() => router.push(`/leads/${l.id}`)}>
+                      {l.sheet_tab ? (
+                        <span className="truncate text-[12px] text-muted-foreground" title={`${l.sheet_tab}${l.sheet_row ? `, row ${l.sheet_row}` : ""}`}>
+                          {tabLabel(l.sheet_tab)} <span className="font-mono text-faint tnum">{l.sheet_row ?? ""}</span>
+                        </span>
+                      ) : (
+                        <span className="text-[12px] text-faint">–</span>
+                      )}
                       <div className="min-w-0">
                         <div className="truncate font-medium">{l.name || <span className="text-faint">No name</span>}</div>
-                        <div className="truncate text-[12px] text-faint">{l.business || "–"}</div>
+                        <div className="truncate text-[12px] text-faint">{[l.business, l.lead_source].filter(Boolean).join(" · ") || "–"}</div>
                       </div>
                       <span className="font-mono text-[12px] tnum">{formatPhone(l.phone)}</span>
                       <span className="truncate text-muted-foreground" title={l.service_required || undefined}>{l.service_required || "–"}</span>

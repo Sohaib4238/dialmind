@@ -54,6 +54,14 @@ class Call(SQLModel, table=True):
     vm_message_left: bool = False  # reached voicemail and the AI said our voicemail message
     email_collected: str = ""  # the address the lead confirmed on this call (collect_email tool)
     email_reason: str = ""  # details / interested / not_now / other
+    direction: str = "outbound"  # outbound (we dialed) / inbound (they called our number; number = the caller)
+    ai_summary: str = ""  # Cartesia's own summary of the call (its call object), for the results sheet
+    # Several supervisors (supervisor.py): who got the pop-up, who said busy, who took it (key = login name)
+    transfer_offered: list = Field(default_factory=list, sa_column=Column(JSON))
+    transfer_declined_by: list = Field(default_factory=list, sa_column=Column(JSON))
+    transfer_to: str = ""
+    transfer_to_name: str = ""
+    transfer_to_phone: str = ""
 
 
 class CallEvent(SQLModel, table=True):
@@ -71,6 +79,7 @@ class CallEvent(SQLModel, table=True):
 LEAD_STATUSES = (
     "new", "calling", "interested", "callback", "not_interested", "needs_review", "voicemail", "no_answer",
     "bad_line", "bad_number", "do_not_contact", "not_a_fit", "failed", "answered", "transferred", "texted",
+    "handled_by_sales",
 )
 
 
@@ -99,7 +108,20 @@ class Lead(SQLModel, table=True):
     attempts: int = 0
     last_call_at: datetime | None = None
     last_call_id: int | None = None
-    source: str = ""  # e.g. the CSV file name, or "manual"
+    source: str = ""  # e.g. the CSV file name, "manual", or "Google Sheet: <tab>"
+    # From the sales team's Google Sheet (sheet_sync.py)
+    lead_source: str = ""  # where the lead came from: Bark, LinkedIn, Facebook... (the sheet's "Source" column)
+    budget: str = ""
+    additional_info: str = ""
+    alt_phones: str = ""  # more numbers from the same cell, E.164, comma-separated (the first valid one is `phone`)
+    alt_emails: str = ""
+    links: str = ""  # website / LinkedIn URLs found in the business description
+    sheet_tab: str = ""
+    sheet_row: int | None = None
+    # The sales team coloured the row green/yellow: never called, status "handled_by_sales" (DNC still wins)
+    sales_handled: bool = Field(default=False, index=True)
+    sales_handled_at: datetime | None = None
+    results_dirty: bool = Field(default=False, index=True)  # its row in the results sheet needs writing
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -178,6 +200,24 @@ NEW_COLUMNS = [
     ("call", "vm_message_left", "BOOLEAN NOT NULL DEFAULT 0"),
     ("call", "email_collected", "VARCHAR NOT NULL DEFAULT ''"),
     ("call", "email_reason", "VARCHAR NOT NULL DEFAULT ''"),
+    ("call", "direction", "VARCHAR NOT NULL DEFAULT 'outbound'"),
+    ("call", "ai_summary", "VARCHAR NOT NULL DEFAULT ''"),
+    ("call", "transfer_offered", "JSON"),
+    ("call", "transfer_declined_by", "JSON"),
+    ("call", "transfer_to", "VARCHAR NOT NULL DEFAULT ''"),
+    ("call", "transfer_to_name", "VARCHAR NOT NULL DEFAULT ''"),
+    ("call", "transfer_to_phone", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "lead_source", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "budget", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "additional_info", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "alt_phones", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "alt_emails", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "links", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "sheet_tab", "VARCHAR NOT NULL DEFAULT ''"),
+    ("lead", "sheet_row", "INTEGER"),
+    ("lead", "sales_handled", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("lead", "sales_handled_at", "DATETIME"),
+    ("lead", "results_dirty", "BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 
@@ -196,6 +236,8 @@ def _migrate() -> None:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
                 if (table, col) == ("lead", "location"):  # older leads only had a city
                     conn.execute(text("UPDATE lead SET location = city WHERE location = ''"))
+                if (table, col) == ("lead", "sales_handled"):
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_lead_sales_handled ON lead (sales_handled)"))
                 if (table, col) == ("lead", "vm_count"):  # statuses renamed when call outcomes came in
                     conn.execute(text("UPDATE lead SET status = 'callback' WHERE status IN ('callback_scheduled', 'not_now')"))
                     conn.execute(text("UPDATE lead SET vm_count = 1 WHERE status = 'voicemail'"))
@@ -244,6 +286,12 @@ def call_to_dict(c: Call) -> dict:
         "vm_message_left": c.vm_message_left,
         "email_collected": c.email_collected,
         "email_reason": c.email_reason,
+        "direction": c.direction or "outbound",
+        "ai_summary": c.ai_summary or "",
+        "transfer_offered": c.transfer_offered or [],
+        "transfer_declined_by": c.transfer_declined_by or [],
+        "transfer_to": c.transfer_to or "",
+        "transfer_to_name": c.transfer_to_name or "",
     }
 
 
@@ -279,6 +327,16 @@ def lead_to_dict(lead: Lead) -> dict:
         "last_call_at": as_utc(lead.last_call_at).isoformat() if lead.last_call_at else None,
         "last_call_id": lead.last_call_id,
         "source": lead.source,
+        "lead_source": lead.lead_source or "",
+        "budget": lead.budget or "",
+        "additional_info": lead.additional_info or "",
+        "alt_phones": [p for p in (lead.alt_phones or "").split(",") if p],
+        "alt_emails": [e for e in (lead.alt_emails or "").split(",") if e],
+        "links": [u for u in (lead.links or "").split(" ") if u],
+        "sheet_tab": lead.sheet_tab or "",
+        "sheet_row": lead.sheet_row,
+        "sales_handled": bool(lead.sales_handled),
+        "sales_handled_at": as_utc(lead.sales_handled_at).isoformat() if lead.sales_handled_at else None,
         "created_at": as_utc(lead.created_at).isoformat() if lead.created_at else None,
     }
 

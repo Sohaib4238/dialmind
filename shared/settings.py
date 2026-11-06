@@ -18,7 +18,7 @@ SETTINGS_PATH = Path(os.getenv("AGENT_SETTINGS_PATH") or Path(__file__).resolve(
 # Lead details, different on every call: sent to Cartesia as dynamic variables ({{lead_name}} ...).
 # specialist_title is worked out from service_required (specialist_titles below): who the lead would talk to.
 LEAD_PLACEHOLDERS = ("lead_name", "business_name", "service_required", "business_description", "job_description", "location",
-                     "specialist_title")
+                     "specialist_title", "lead_source")
 # Our own details, the same on every call: {callback_number} is company_phone.
 COMPANY_PLACEHOLDERS = ("caller_name", "company_name", "callback_number", "company_website", "company_address")
 # Only in the email and text (SMS) templates (filled by the backend when it sends one).
@@ -26,7 +26,35 @@ EMAIL_PLACEHOLDERS = ("callback_time",)
 FOLLOW_UP_SECTIONS = ("emails.", "sms.")
 # A text is cut into 160-character pieces (each billed); keep templates to about two.
 SMS_MAX_CHARS = 300
-PLACEHOLDERS = {*COMPANY_PLACEHOLDERS, *LEAD_PLACEHOLDERS, *EMAIL_PLACEHOLDERS}
+# Only in the opening line: the sentence about where the lead came from (lead_sources below), filled per call.
+OPENING_PLACEHOLDERS = ("source_line",)
+PLACEHOLDERS = {*COMPANY_PLACEHOLDERS, *LEAD_PLACEHOLDERS, *EMAIL_PLACEHOLDERS, *OPENING_PLACEHOLDERS}
+# The introduction: our company name only when they ask (2026-11-05). The old default is read as the new one.
+OLD_OPENING_LINE = "Hey, this is {caller_name} from {company_name}. Did I catch you at an okay time?"
+DEFAULT_OPENING_LINE = "Hi, this is {caller_name}. {source_line} Is now an okay time?"
+_OPTIONAL = re.compile(r"\[([^\[\]]*)\]")
+
+
+def check_brackets(v: str) -> str:
+    """[optional parts] must be closed and not nested."""
+    depth = 0
+    for ch in v:
+        depth += {"[": 1, "]": -1}.get(ch, 0)
+        if depth < 0 or depth > 1:
+            raise ValueError("a [ ] part is not closed properly, or is inside another one")
+    if depth:
+        raise ValueError("a [ is never closed with ]")
+    return v
+
+
+def drop_empty_parts(text: str, values: dict[str, str]) -> str:
+    """Leave out every [part] that uses a placeholder whose value is empty, and keep the others without the brackets.
+    "I saw your request on Bark[ for {service_required}]" -> "...on Bark" when service_required is empty."""
+    def one(m: re.Match) -> str:
+        part = m.group(1)
+        names = [n for _, n, _, _ in string.Formatter().parse(part) if n]
+        return "" if any(not (values.get(n) or "").strip() for n in names) else part
+    return _OPTIONAL.sub(one, text)
 # The voicemail message must fit in about 20 seconds (~2.5 spoken words a second).
 VOICEMAIL_MAX_WORDS = 50
 
@@ -210,12 +238,55 @@ class Voice(_Strict):
         return v
 
 
+OLD_SILENT_GREETING = "Hi, is this {lead_name}? This is {caller_name} from {company_name}."  # until 2026-11-04
+SILENT_CHECK_MAX_WORDS = 8
+
+
 class CallStart(_Strict):
-    """Who speaks first: the AI gives the callee a few seconds to say hello, then greets them itself."""
+    """Who speaks first: the AI gives the callee a few seconds to say hello. If they stay silent it only checks that
+    they can hear ("Hello?"); its introduction comes once, after they've spoken (History #38)."""
 
     greet_if_silent: bool = True
     wait_seconds: int = Field(default=4, ge=2, le=8)
-    silent_greeting: str = Field(default="Hi, is this {lead_name}? This is {caller_name} from {company_name}.", min_length=1)
+    silent_greeting: str = Field(default="Hello?", min_length=1, max_length=80)
+
+    @field_validator("silent_greeting", mode="before")
+    @classmethod
+    def _old_default(cls, v):
+        # The old default was a whole introduction: said to a silent callee, then again after their hello.
+        return "Hello?" if isinstance(v, str) and v.strip() == OLD_SILENT_GREETING else v
+
+    @field_validator("silent_greeting")
+    @classmethod
+    def _short_check(cls, v: str) -> str:
+        if "\n" in v:
+            raise ValueError("must be one line")
+        if "{caller_name}" in v or "{company_name}" in v:
+            raise ValueError("just a short check like \"Hello?\": the AI introduces itself once, after they've spoken")
+        if spoken_words(v) > SILENT_CHECK_MAX_WORDS:
+            raise ValueError(f"keep it to a short check like \"Hello, can you hear me?\" (at most {SILENT_CHECK_MAX_WORDS} words)")
+        return v
+
+
+class Inbound(_Strict):
+    """Calls TO our number (a lead calling back, a new caller). Off: our number isn't connected to the AI.
+    The AI answers with `greeting`, then looks the caller up in our leads (lookup_caller tool) before it says more."""
+
+    enabled: bool = False
+    greeting: str = Field(default="Thanks for calling {company_name}, this is {caller_name}. How can I help you?",
+                          min_length=1, max_length=300)
+    new_caller: str = Field(default="Ask for their name, then their business name, then what they need help with, one "
+                                    "question at a time. Then carry on like our normal call.", min_length=1)
+
+    @field_validator("greeting")
+    @classmethod
+    def _no_lead_details(cls, v: str) -> str:
+        if "\n" in v:
+            raise ValueError("must be one line")
+        if any("{" + k + "}" in v for k in LEAD_PLACEHOLDERS):
+            raise ValueError("can't use lead details like {lead_name}: the AI doesn't know who's calling until after "
+                             "the greeting. It greets a known lead by name right after.")
+        return v
 
 
 class Silence(_Strict):
@@ -234,6 +305,35 @@ class Silence(_Strict):
             raise ValueError(f"max_silence_seconds must be at least {need} (two check-ins of "
                              f"{self.silence_check_seconds}s plus time to say the closing line)")
         return self
+
+
+class LeadSources(_Strict):
+    """How the introduction says where the lead came from ({source_line} in the opening line). The source is the
+    sales sheet's "Source" column ({lead_source}). Parts in [square brackets] are left out when a detail in them is
+    empty."""
+
+    # Where we found the business ourselves (one per line or comma-separated); any other source is a request they made
+    found_sources: str = "LinkedIn, Facebook, Instagram"
+    request_line: str = Field(default="I saw your request on {lead_source}[ for {service_required}][ for your {business_name}].",
+                              min_length=1, max_length=300)
+    found_line: str = Field(default="I came across your business on {lead_source}.", min_length=1, max_length=300)
+    no_source_line: str = Field(default="[I saw you were looking for help with {service_required}.]", max_length=300)
+
+    @field_validator("request_line", "found_line", "no_source_line")
+    @classmethod
+    def _line(cls, v: str) -> str:
+        if "\n" in v:
+            raise ValueError("must be one line")
+        if "{source_line}" in v:
+            raise ValueError("{source_line} only goes in the opening line")
+        return check_brackets(v)
+
+    def kind(self, source: str) -> str:
+        """"found" / "request" / "none" for a lead source like "Bark" or "LinkedIn Sales Navigator"."""
+        src = (source or "").strip().lower()
+        if not src:
+            return "none"
+        return "found" if any(k in src for k in keywords(self.found_sources)) else "request"
 
 
 class Dialer(_Strict):
@@ -295,7 +395,9 @@ class AgentSettings(_Strict):
     company_website: str = ""
     company_address: str = ""  # required by law in every email: emails aren't sent while it's empty
     opening_line: str = Field(min_length=1)
+    lead_sources: LeadSources = Field(default_factory=LeadSources)
     call_start: CallStart = Field(default_factory=CallStart)
+    inbound: Inbound = Field(default_factory=Inbound)
     speaking_style: str = Field(min_length=1)
     main_script: str = Field(min_length=1)
     ai_receptionist_script: str = Field(min_length=1)
@@ -312,6 +414,18 @@ class AgentSettings(_Strict):
     dialer: Dialer
     service_fit: ServiceFit
     settings: CallSettings
+
+    @field_validator("opening_line", mode="before")
+    @classmethod
+    def _old_opening(cls, v):
+        return DEFAULT_OPENING_LINE if isinstance(v, str) and v.strip() == OLD_OPENING_LINE else v
+
+    @field_validator("opening_line")
+    @classmethod
+    def _opening(cls, v: str) -> str:
+        if "\n" in v:
+            raise ValueError("must be one line")
+        return check_brackets(v)
 
     @model_validator(mode="after")
     def _known_placeholders(self) -> "AgentSettings":
@@ -330,6 +444,8 @@ class AgentSettings(_Strict):
                     if name in EMAIL_PLACEHOLDERS and not path.startswith(FOLLOW_UP_SECTIONS):
                         raise ValueError(f"{path}: unknown placeholder {{{name}}} (it can only be used in the "
                                          "email and text templates)")
+                    if name in OPENING_PLACEHOLDERS and path != "opening_line":
+                        raise ValueError(f"{path}: {{{name}}} can only be used in the opening line")
             elif isinstance(value, BaseModel):
                 for k in type(value).model_fields:
                     check(getattr(value, k), f"{path}.{k}" if path else k)
@@ -346,9 +462,10 @@ class AgentSettings(_Strict):
         extra: values for the email/text-only placeholders ({callback_time})."""
         lead_values = {k: (lead or {}).get(k, "") if lead is not None else "{{" + k + "}}" for k in LEAD_PLACEHOLDERS}
         email_values = {k: (extra or {}).get(k, "") for k in EMAIL_PLACEHOLDERS}
+        opening_values = {k: (extra or {}).get(k, "{{" + k + "}}") for k in OPENING_PLACEHOLDERS}
         return text.format(caller_name=self.caller_name, company_name=self.company_name,
                            callback_number=self.company_phone, company_website=self.company_website,
-                           company_address=self.company_address, **lead_values, **email_values)
+                           company_address=self.company_address, **lead_values, **email_values, **opening_values)
 
 
 def load_settings(path: Path = SETTINGS_PATH) -> AgentSettings:

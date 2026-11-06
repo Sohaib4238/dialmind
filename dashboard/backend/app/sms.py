@@ -374,6 +374,8 @@ def for_call(call_id: int) -> dict | None:
         done = db.exec(select(SmsMessage).where(SmsMessage.call_id == call_id)).first()
     if call is None or lead is None or done is not None or call.status not in ("ended", "failed"):
         return sms_to_dict(done) if done else None
+    if call.direction == "inbound":
+        return None  # they called us (they have our number): no follow-up text
     try:
         s = load_settings()
     except SettingsError:

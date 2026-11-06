@@ -15,10 +15,15 @@ from sqlmodel import select
 from app import cartesia, storage, tunnel
 from app.db import Call, as_utc, get_session
 
-# Cartesia free plan: $1 of agent credit per month at $0.06/min (~16.7 min). No usage API exists,
-# so this is our own estimate from call durations recorded in the dashboard.
-FREE_AGENT_DOLLARS = float(os.getenv("CARTESIA_FREE_DOLLARS", "1.0"))
-AGENT_RATE_PER_MIN = 0.06
+# Cartesia Pro plan (since 2026-11-04): $6 of Voice Agent dollars a month, Managed Agents $0.03/min, overages OFF
+# (calls fail once it's used up). Real usage: GET /usage/agents, which needs an ADMIN key (CARTESIA_ADMIN_API_KEY,
+# optional, made in the Playground under Keys -> Admin). Without one: an estimate from our own call log.
+PLAN_NAME = os.getenv("CARTESIA_PLAN_NAME", "Pro")
+PLAN_DOLLARS = float(os.getenv("CARTESIA_PLAN_DOLLARS", "6.0"))
+AGENT_RATE_PER_MIN = float(os.getenv("CARTESIA_AGENT_RATE", "0.03"))
+USAGE_REFRESH_S = 300  # ask Cartesia at most this often
+USAGE_MAX_AGE_S = 1800  # older than this: back to our estimate
+_usage: dict = {"at": 0.0, "cents": None, "minutes": None, "calls": None, "error": None}
 
 HOSTS = ("api.cartesia.ai", "sip.telnyx.com", "api.telnyx.com")
 
@@ -92,17 +97,66 @@ def minutes_used_this_month() -> float:
     return round(secs / 60, 1)
 
 
+def _month_start() -> datetime:
+    return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+async def refresh_usage(force: bool = False) -> dict:
+    """This month's agent usage from Cartesia (admin key only). Never raises; the key is never logged."""
+    key = (os.getenv("CARTESIA_ADMIN_API_KEY") or "").strip()
+    if not key:
+        _usage["error"] = "no admin key"
+        return _usage
+    if not force and time.time() - _usage["at"] < USAGE_REFRESH_S and _usage["cents"] is not None:
+        return _usage
+    url = f"{cartesia.BASE_URL}/usage/agents"
+    params = {"start_ts": _month_start().strftime("%Y-%m-%dT%H:%M:%SZ")}
+    headers = {"Authorization": f"Bearer {key}", "Cartesia-Version": cartesia.API_VERSION}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
+            async with http.get(url, params=params, headers=headers) as resp:
+                body = await resp.json(content_type=None)
+                if resp.status != 200:
+                    raise ValueError(f"HTTP {resp.status}: {str((body or {}).get('message', ''))[:120]}")
+        rows = body.get("data") or []
+        _usage.update(at=time.time(), cents=sum(int(r.get("cents") or 0) for r in rows),
+                      minutes=round(sum(float(r.get("minutes") or 0) for r in rows), 1),
+                      calls=sum(int(r.get("calls") or 0) for r in rows), error=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError, AttributeError) as e:
+        _usage["error"] = f"Cartesia usage API: {e}"
+    return _usage
+
+
+def budget() -> dict:
+    """The plan's agent dollars this month: used, left, and how many minutes that is at the agent rate."""
+    real = _usage["cents"] is not None and time.time() - _usage["at"] < USAGE_MAX_AGE_S
+    used_min = _usage["minutes"] if real else minutes_used_this_month()
+    used = _usage["cents"] / 100 if real else used_min * AGENT_RATE_PER_MIN
+    left = max(0.0, PLAN_DOLLARS - used)
+    return {"plan": PLAN_NAME, "plan_dollars": PLAN_DOLLARS, "rate_per_min": AGENT_RATE_PER_MIN,
+            "used_dollars": round(used, 2), "left_dollars": round(left, 2), "used_minutes": round(used_min, 1),
+            "minutes_left": round(left / AGENT_RATE_PER_MIN, 1), "calls": _usage["calls"] if real else None,
+            "source": "cartesia" if real else "estimate", "error": _usage["error"]}
+
+
 def minutes_left() -> float:
-    return max(0.0, round(FREE_AGENT_DOLLARS / AGENT_RATE_PER_MIN - minutes_used_this_month(), 1))
+    return budget()["minutes_left"]
 
 
 async def check_minutes() -> dict:
     t = time.perf_counter()
-    used = minutes_used_this_month()
-    total = round(FREE_AGENT_DOLLARS / AGENT_RATE_PER_MIN, 1)
-    left = max(0.0, round(total - used, 1))
-    detail = f"~{used} of ~{total} free minutes used this month, ~{left} left (estimate from our call log; exact usage on play.cartesia.ai)"
-    return _result("Cartesia minutes", left > 0, detail, t, warn=left < total * 0.3)
+    await refresh_usage(force=True)
+    b = budget()
+    head = (f"{b['plan']} plan: ${b['left_dollars']:.2f} of ${b['plan_dollars']:.2f} left this month, "
+            f"about {b['minutes_left']:g} min at ${b['rate_per_min']:.2f}/min. ")
+    if b["source"] == "cartesia":
+        tail = f"Used ${b['used_dollars']:.2f} ({b['used_minutes']:g} min, {b['calls']} calls), from Cartesia."
+    else:
+        why = "Add CARTESIA_ADMIN_API_KEY for Cartesia's real numbers" if b["error"] == "no admin key" else b["error"]
+        tail = f"Estimate from our call log (~{b['used_minutes']:g} min used; LLM tokens not counted). {why}."
+    tail += " Overages are off: calls stop at $0."
+    return _result("Cartesia balance", b["minutes_left"] > 0, head + tail, t,
+                   warn=b["left_dollars"] < b["plan_dollars"] * 0.3 or b["source"] != "cartesia")
 
 
 async def check_telnyx(http: aiohttp.ClientSession) -> dict:

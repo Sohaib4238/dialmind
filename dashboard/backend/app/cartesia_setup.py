@@ -10,7 +10,11 @@ Resources (IDs saved in .env, secrets never printed):
   CARTESIA_OUTCOME_TOOL_ID  record_outcome webhook tool -> https://<tunnel>/api/cartesia/tools/record_outcome
   CARTESIA_SUPERVISOR_TOOL_ID  request_supervisor webhook tool -> .../api/cartesia/tools/request_supervisor
   CARTESIA_EMAIL_TOOL_ID    collect_email webhook tool -> .../api/cartesia/tools/collect_email
-  CARTESIA_TOOL_SECRET      generated here; Cartesia sends it as Authorization: Bearer (all three tools)
+  CARTESIA_TOOL_SECRET      generated here; Cartesia sends it as Authorization: Bearer (all tools)
+Inbound calls (app/inbound.py), created the first time "Inbound calls" is switched on:
+  CARTESIA_INBOUND_AGENT_ID     the agent that answers our number (same settings, its own start)
+  CARTESIA_LOOKUP_TOOL_ID       lookup_caller -> .../api/cartesia/tools/lookup_caller
+  CARTESIA_SAVE_CALLER_TOOL_ID  save_caller -> .../api/cartesia/tools/save_caller
 The background sound files are uploaded when first switched on; their IDs are in data/cartesia_state.json.
 """
 
@@ -24,8 +28,9 @@ from env_utils import save_env  # shared/env_utils.py
 from settings import AgentSettings, load_settings
 
 from app import ambience, cartesia, standby
-from app.agent_config import (EMAIL_TOOL_PATH, OUTCOME_TOOL_PATH, SUPERVISOR_TOOL_PATH, build_config, config_hash,
-                              email_tool_body, outcome_tool_body, supervisor_tool_body)
+from app.agent_config import (EMAIL_TOOL_PATH, LOOKUP_TOOL_PATH, OUTCOME_TOOL_PATH, SAVE_CALLER_TOOL_PATH,
+                              SUPERVISOR_TOOL_PATH, build_config, build_inbound_config, config_hash, email_tool_body,
+                              lookup_tool_body, outcome_tool_body, save_caller_tool_body, supervisor_tool_body)
 from app.db import DATA_DIR
 
 # Label of our trunk in Cartesia; a different label per Telnyx account.
@@ -201,6 +206,74 @@ async def sync_agent(reason: str = "settings sync") -> dict:
     return {"agent_id": agent["id"], "action": "created", "hash": h, "ambience_error": ambience_error}
 
 
+INBOUND_AGENT_NAME = "DialMind - inbound"
+
+
+def inbound_config(s: AgentSettings | None = None) -> dict:
+    from app import supervisor
+
+    s = s or load_settings()
+    return build_inbound_config(s, supervisor.phones(), _ambience_file_id(s))
+
+
+async def sync_inbound_agent(reason: str = "settings sync") -> dict:
+    """Create the inbound agent (CARTESIA_INBOUND_AGENT_ID) or push the current settings to it when they changed.
+    Like sync_agent; the background sound is dropped if Cartesia refuses it."""
+    s = load_settings()
+    try:
+        await _ensure_ambience_file(s)
+    except (cartesia.CartesiaError, ambience.SoundError, KeyError) as e:
+        logger.warning("background sound (inbound): %s", e)
+    config = inbound_config(s)
+    h = config_hash(config)
+    agent_id = _env("CARTESIA_INBOUND_AGENT_ID")
+    if agent_id:
+        if _state().get("inbound_agent_config_hash") == h:
+            return {"agent_id": agent_id, "action": "unchanged", "hash": h}
+        try:
+            try:
+                await cartesia.update_agent_config(agent_id, config, f"Dashboard (inbound): {reason}")
+            except cartesia.CartesiaError as e:
+                if e.status == 404 or not config["audio"]["output"]["background_sound"]:
+                    raise
+                config = {**config, "audio": {**config["audio"], "output": {**config["audio"]["output"], "background_sound": None}}}
+                await cartesia.update_agent_config(agent_id, config, f"Dashboard (inbound): {reason}, without the background sound")
+                h = config_hash(config)
+            _save_state(inbound_agent_config_hash=h, inbound_synced_at=time.time())
+            return {"agent_id": agent_id, "action": "updated", "hash": h}
+        except cartesia.CartesiaError as e:
+            if e.status != 404:
+                raise
+    agent = await cartesia.create_agent(INBOUND_AGENT_NAME, "Answers calls to our number (config from agent_settings.yaml)", config)
+    save_env("CARTESIA_INBOUND_AGENT_ID", agent["id"])
+    _save_state(inbound_agent_config_hash=h, inbound_synced_at=time.time())
+    return {"agent_id": agent["id"], "action": "created", "hash": h}
+
+
+async def ensure_lookup_tool(public_base_url: str) -> dict:
+    """lookup_caller (inbound calls): who is calling. Created the first time inbound calls are switched on."""
+    url = public_base_url.rstrip("/") + LOOKUP_TOOL_PATH
+    return await _ensure_tool(lookup_tool_body(url, _tool_secret()), "CARTESIA_LOOKUP_TOOL_ID", "lookup_tool_body_hash")
+
+
+async def ensure_save_caller_tool(public_base_url: str) -> dict:
+    """save_caller (inbound calls): a new caller -> a new lead."""
+    url = public_base_url.rstrip("/") + SAVE_CALLER_TOOL_PATH
+    return await _ensure_tool(save_caller_tool_body(url, _tool_secret()), "CARTESIA_SAVE_CALLER_TOOL_ID",
+                              "save_caller_tool_body_hash")
+
+
+async def attach_webhook_to(agent_id: str) -> bool:
+    """Our call-events webhook on another agent too (the inbound one). False when there's no webhook yet."""
+    webhook_id = _env("CARTESIA_WEBHOOK_ID")
+    if not webhook_id:
+        return False
+    record = await cartesia.get_agent_record(agent_id)
+    if record.get("webhook_id") != webhook_id:
+        await cartesia.attach_webhook(agent_id, webhook_id)
+    return True
+
+
 def _tool_secret() -> str:
     secret = _env("CARTESIA_TOOL_SECRET")
     if not secret:
@@ -220,8 +293,23 @@ async def ensure_supervisor_tool(public_base_url: str) -> dict:
     """The request_supervisor webhook tool (Phase 6), like ensure_outcome_tool. Once it exists, the agent
     config also gets the transfer_to_number system tool and the hand-off instructions."""
     url = public_base_url.rstrip("/") + SUPERVISOR_TOOL_PATH
-    return await _ensure_tool(supervisor_tool_body(url, _tool_secret()), "CARTESIA_SUPERVISOR_TOOL_ID",
-                              "supervisor_tool_body_hash")
+    body = supervisor_tool_body(url, _tool_secret())
+    if _state().get("supervisor_assignments") is False and _state().get("supervisor_assignments_tried") == _tool_hash(body):
+        body.pop("assignments", None)  # refused before for this same definition: don't ask again on every start
+    try:
+        res = await _ensure_tool(body, "CARTESIA_SUPERVISOR_TOOL_ID", "supervisor_tool_body_hash")
+    except cartesia.CartesiaError as e:
+        if "assignments" not in body or e.status not in (400, 422):
+            raise
+        # Cartesia refused the assignment: the transfer then always rings the first available supervisor.
+        logger.warning("request_supervisor: Cartesia refused the transfer_number assignment (%s)", e)
+        _save_state(supervisor_assignments=False, supervisor_assignments_tried=_tool_hash(body),
+                    supervisor_assignments_error=str(e)[:300])
+        body.pop("assignments")
+        return await _ensure_tool(body, "CARTESIA_SUPERVISOR_TOOL_ID", "supervisor_tool_body_hash")
+    if "assignments" in body:
+        _save_state(supervisor_assignments=True, supervisor_assignments_error="")
+    return res
 
 
 async def ensure_email_tool(public_base_url: str) -> dict:

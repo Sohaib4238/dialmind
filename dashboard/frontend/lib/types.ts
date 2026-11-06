@@ -8,7 +8,7 @@ export interface Call {
   status: CallStatus
   result: CallResult
   reason: string
-  source: "dashboard" | "cli" | "simulated"
+  source: "dashboard" | "cli" | "simulated" | "inbound"
   simulated: boolean
   created_at: string
   answered_at: string | null
@@ -27,6 +27,12 @@ export interface Call {
   vm_message_left?: boolean
   email_collected?: string
   email_reason?: "details" | "interested" | "not_now" | "other" | ""
+  direction?: "outbound" | "inbound"
+  ai_summary?: string
+  transfer_offered?: string[]
+  transfer_declined_by?: string[]
+  transfer_to?: string
+  transfer_to_name?: string
 }
 
 export type TransferStatus =
@@ -55,6 +61,8 @@ export type StreamMessage =
   | { type: "supervisor_settings"; settings: SupervisorSettings }
   | { type: "email"; email: Email }
   | { type: "sms"; sms: Sms }
+  | { type: "sheet_sync"; summary: SheetSyncSummary }
+  | { type: "sheet_results"; results: SheetResults }
 
 export interface AppConfig {
   dev: boolean
@@ -108,6 +116,16 @@ export interface SettingsPayload {
   file_error: string | null
   path: string
   sync?: SyncStatus
+  inbound?: InboundStatus
+}
+
+/** Inbound calls (Instructions page): does Cartesia answer our number? */
+export interface InboundStatus {
+  enabled: boolean
+  number: string
+  state: "unknown" | "off" | "on" | "pending" | "error" | "standby"
+  detail: string
+  checked_at: number | null
 }
 
 export interface SyncStatus {
@@ -120,6 +138,7 @@ export interface SaveResult {
   version: string
   backup: string
   cartesia?: { ok: boolean; action?: string; detail?: string }
+  inbound?: InboundStatus
 }
 
 export interface Ambience {
@@ -174,6 +193,7 @@ export interface VoiceList {
 export type LeadStatus =
   | "new" | "calling" | "interested" | "callback" | "not_interested" | "needs_review" | "voicemail" | "no_answer"
   | "bad_line" | "bad_number" | "do_not_contact" | "not_a_fit" | "failed" | "answered" | "transferred" | "texted"
+  | "handled_by_sales"
 
 export type Outcome =
   | "interested" | "not_now" | "gatekeeper" | "not_interested" | "do_not_contact" | "wrong_number"
@@ -208,6 +228,16 @@ export interface Lead {
   last_call_at: string | null
   last_call_id: number | null
   source: string
+  lead_source: string
+  budget: string
+  additional_info: string
+  alt_phones: string[]
+  alt_emails: string[]
+  links: string[]
+  sheet_tab: string
+  sheet_row: number | null
+  sales_handled: boolean
+  sales_handled_at: string | null
   created_at: string | null
 }
 
@@ -352,8 +382,13 @@ export interface DialerState {
   wait_detail: string
   minutes_left: number
   limits: { max_calls?: number; max_retries?: number; retry_gap_hours?: number; pause_after_failures?: number; min_free_minutes?: number; hours?: string; days?: string[]; error?: string }
+  /** New leads: sheet order (top to bottom, first tab first) or newest first. */
+  order?: DialerOrder
+  orders?: Record<DialerOrder, string>
   log: DialerLogEntry[]
 }
+
+export type DialerOrder = "sheet" | "newest"
 
 export interface AuthMe {
   remote: boolean
@@ -370,11 +405,20 @@ export interface SupervisorHours {
   days: string[]
 }
 
-export interface SupervisorSettings {
+/** One supervisor: own login (key), own transfer phone, own "available" switch, own working hours. */
+export interface SupervisorPerson {
+  key: string
+  name: string
   phone: string
   available: boolean
-  wait_seconds: number
   hours: SupervisorHours
+  can_take_calls: boolean
+  why_not: string
+}
+
+export interface SupervisorSettings {
+  wait_seconds: number
+  people: SupervisorPerson[]
   can_take_calls: boolean
   why_not: string
   hours_zones: Record<string, string>
@@ -383,11 +427,86 @@ export interface SupervisorSettings {
   dashboard_url?: string | null
   login_configured?: boolean
   transfer_ready?: boolean
+  me?: string | null
+  is_admin?: boolean
+  me_supervisor?: boolean
+  logins?: string[]
+  assignments?: boolean | null
+  assignments_error?: string
+}
+
+export interface SheetSyncSummary {
+  ok: boolean
+  at?: string
+  error?: string
+  trigger?: string
+  tabs?: Record<string, number>
+  rows?: number
+  new?: number
+  duplicates?: number
+  filled?: number
+  /** Leads whose row moved in the sheet (rows inserted / deleted above them). */
+  moved?: number
+  /** "Re-check colours": only the colour rule on existing leads; nothing imported. */
+  colors_only?: boolean
+  not_imported?: number
+  handled?: { new: number; existing: number; skipped: number }
+  handled_colors?: string[]
+  skipped_count?: number
+  skipped?: { tab: string; row: number | null; name?: string; reason: string; group?: string }[]
+  skipped_groups?: { group: string; reason: string; count: number }[]
+  /** Every distinct background colour found: rows with it in any cell (hex "" = no fill). */
+  colors?: { tab: string; hex: string; family: string; label: string; rows: number; handled: boolean }[]
+  /** What each row was read as (one colour per row). */
+  row_colors?: Record<string, { family: string; label: string; rows: number; handled: boolean }[]>
+  /** Conditional-formatting rules / alternating colours per tab: their colours aren't seen. */
+  color_rules?: Record<string, { conditional: number; banded: number }>
+  duplicate_rows?: { tab: string; row: number; name: string; phone: string; reason: string; lead_id?: number }[]
+  marked_handled?: { tab: string; row: number; name: string; lead_id: number; color: string }[]
+  missing_tabs?: string[]
+}
+
+export interface SheetResults {
+  ok: boolean
+  at: string
+  error?: string
+  written?: number
+  updated?: number
+  added?: number
+}
+
+export interface SheetSettings {
+  enabled: boolean
+  sales_sheet: string
+  tabs: string[]
+  sync_minutes: number
+  handled_colors: string[]
+  handled_action: "import" | "skip"
+  results_sheet: string
+  results_tab: string
+  results_timezone: string
+  dialer_order: DialerOrder
+}
+
+export interface SheetsStatus {
+  settings: SheetSettings
+  key: { ok: boolean; client_email: string; detail: string }
+  last_sync: SheetSyncSummary | null
+  results: SheetResults | null
+  next_sync_at: string | null
+  running: boolean
+  standby: boolean
+  colors: string[]
+  /** Never called whatever is saved: green, yellow, red. */
+  always_handled: string[]
+  result_zones: Record<string, string>
+  dialer_orders: Record<DialerOrder, string>
 }
 
 /** What the supervisor's pop-up shows (one open request per call). */
 export interface SupervisorRequest {
   call_id: number
+  direction?: "outbound" | "inbound"
   lead_id: number | null
   status: TransferStatus
   label: string
@@ -396,6 +515,10 @@ export interface SupervisorRequest {
   requested_at: string | null
   deadline: string | null
   wait_seconds: number
+  offered?: { key: string; name: string }[]
+  declined_by?: string[]
+  taken_by?: string
+  taken_by_key?: string
   lead: {
     lead_name: string
     business_name: string

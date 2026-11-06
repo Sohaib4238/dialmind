@@ -7,7 +7,7 @@ import { useParams, useRouter } from "next/navigation"
 import { useCallback, useEffect, useState } from "react"
 import { toast } from "sonner"
 
-import { EmptyState, PageHeader, Panel, PanelHeader, ResultTag, SkeletonLine } from "@/components/common"
+import { EmptyState, PageHeader, Panel, PanelHeader, ResultTag, SkeletonLine, Tag } from "@/components/common"
 import { EmailList, EmailSetupNote } from "@/components/emails"
 import { SmsList, SmsSetupNote } from "@/components/texts"
 import { LeadStatusTag } from "@/components/lead-status"
@@ -85,6 +85,20 @@ export default function LeadDetailPage() {
     }
   }
 
+  const clearHandled = async () => {
+    if (!lead) return
+    setBusy(true)
+    try {
+      await api.setSalesHandled(lead.id, false)
+      toast.success("Back to normal calling", { description: "The next sheet sync marks it again while its row is still coloured." })
+      load()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : "Couldn't update the lead")
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const callAnyway = async () => {
     if (!lead) return
     setBusy(true)
@@ -142,8 +156,8 @@ export default function LeadDetailPage() {
                 </Button>
               )}
               {admin && (
-                <Button size="sm" disabled={busy || lead.dnc || isActive(data!.calls[0]?.status ?? "ended")} onClick={call}
-                  title={lead.dnc ? "This number is on the Do-Not-Contact list" : undefined}>
+                <Button size="sm" disabled={busy || lead.dnc || lead.sales_handled || isActive(data!.calls[0]?.status ?? "ended")} onClick={call}
+                  title={lead.dnc ? "This number is on the Do-Not-Contact list" : lead.sales_handled ? "The sales team is handling this lead" : undefined}>
                   <Phone strokeWidth={1.75} />
                   Call this lead
                 </Button>
@@ -174,6 +188,17 @@ export default function LeadDetailPage() {
         </motion.div>
       )}
 
+      {lead?.sales_handled && (
+        <Panel className="mb-6 flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-[13px]">
+          <p className="text-muted-foreground">
+            <span className="font-medium text-foreground">Handled by sales.</span> Its row is coloured in the sales team&apos;s
+            sheet{lead.sheet_tab ? ` (${lead.sheet_tab}${lead.sheet_row ? `, row ${lead.sheet_row}` : ""})` : ""}, so the AI
+            never calls it{lead.sales_handled_at ? ` (since ${timeAgo(lead.sales_handled_at)})` : ""}.
+          </p>
+          {admin && <Button size="sm" variant="ghost" disabled={busy} onClick={clearHandled}>Call it again</Button>}
+        </Panel>
+      )}
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
         <div className="flex flex-col gap-6 lg:col-span-8">
           <Panel>
@@ -186,8 +211,11 @@ export default function LeadDetailPage() {
               <ul className="divide-y divide-border">
                 {data.calls.map((c, i) => (
                   <motion.li key={c.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.18, delay: Math.min(i, 8) * 0.02 }}>
-                    <Link href={`/history/${c.id}`} className="group grid grid-cols-[150px_110px_1fr_64px_20px] items-center gap-4 px-4 py-2.5 text-[13px] transition-colors duration-[120ms] hover:bg-surface-2">
-                      <span className="text-muted-foreground tnum">{formatDateTime(c.created_at)}</span>
+                    <Link href={`/history/${c.id}`} className="group grid grid-cols-[minmax(150px,auto)_160px_1fr_64px_20px] items-center gap-4 px-4 py-2.5 text-[13px] transition-colors duration-[120ms] hover:bg-surface-2">
+                      <span className="flex items-center gap-2 text-muted-foreground tnum">
+                        {formatDateTime(c.created_at)}
+                        {c.direction === "inbound" && <Tag tone="signal">Inbound</Tag>}
+                      </span>
                       <span>{!isActive(c.status) && c.outcome ? <OutcomeTag outcome={c.outcome} messageLeft={c.vm_message_left} /> : <ResultTag result={c.result} active={isActive(c.status)} />}</span>
                       <span className="truncate text-muted-foreground" title={c.outcome_note || c.reason}>{c.outcome_note || c.reason || "–"}</span>
                       <span className="text-right font-mono text-muted-foreground tnum">{formatDuration(c.duration_s)}</span>
@@ -236,8 +264,20 @@ export default function LeadDetailPage() {
             <dl className="grid grid-cols-[96px_1fr] gap-y-2 p-4 text-[13px]">
               <dt className="text-faint">Phone</dt>
               <dd className="font-mono tnum">{lead ? formatPhone(lead.phone) : "–"}</dd>
+              {!!lead?.alt_phones.length && (
+                <>
+                  <dt className="text-faint">Other numbers</dt>
+                  <dd className="font-mono text-muted-foreground tnum">{lead.alt_phones.map(formatPhone).join(", ")}</dd>
+                </>
+              )}
               <dt className="text-faint">Email</dt>
               <dd className="truncate text-muted-foreground" title={lead?.email || undefined}>{lead?.email || "–"}</dd>
+              {!!lead?.alt_emails.length && (
+                <>
+                  <dt className="text-faint">Other emails</dt>
+                  <dd className="break-words text-muted-foreground">{lead.alt_emails.join(", ")}</dd>
+                </>
+              )}
               <dt className="text-faint">Status</dt>
               <dd>{lead ? <LeadStatusTag status={lead.status} /> : "–"}</dd>
               <dt className="text-faint">Time zone</dt>
@@ -246,8 +286,12 @@ export default function LeadDetailPage() {
               <dd className="font-mono tnum">{lead?.attempts ?? "–"}</dd>
               <dt className="text-faint">Last call</dt>
               <dd className="text-muted-foreground">{lead?.last_call_at ? timeAgo(lead.last_call_at) : "–"}</dd>
-              <dt className="text-faint">Source</dt>
-              <dd className="truncate text-muted-foreground">{lead?.source || "–"}</dd>
+              <dt className="text-faint">Lead source</dt>
+              <dd className="truncate text-muted-foreground">{lead?.lead_source || "–"}</dd>
+              <dt className="text-faint">Imported from</dt>
+              <dd className="truncate text-muted-foreground" title={lead?.source || undefined}>
+                {lead?.source || "–"}{lead?.sheet_row ? `, row ${lead.sheet_row}` : ""}
+              </dd>
               {lead?.dnc && (
                 <>
                   <dt className="text-faint">Do not contact</dt>
@@ -262,15 +306,28 @@ export default function LeadDetailPage() {
             <dl className="space-y-3 p-4 text-[13px]">
               {([
                 ["Service required", lead?.service_required],
+                ["Budget", lead?.budget],
                 ["Location", lead?.location || lead?.city],
                 ["Business", lead?.business_description],
                 ["Job", lead?.job_description],
-              ] as const).map(([label, value]) => (
+                ["Additional info", lead?.additional_info],
+              ] as const).filter(([label, value]) => value || !["Budget", "Additional info"].includes(label)).map(([label, value]) => (
                 <div key={label}>
                   <dt className="text-[12px] text-faint">{label}</dt>
                   <dd className={cn("mt-0.5 leading-5 break-words", value ? "text-foreground" : "text-faint")}>{value || "Not given"}</dd>
                 </div>
               ))}
+              {!!lead?.links.length && (
+                <div>
+                  <dt className="text-[12px] text-faint">Links</dt>
+                  <dd className="mt-0.5 space-y-0.5">
+                    {lead.links.map((u) => (
+                      <a key={u} href={/^https?:\/\//.test(u) ? u : `https://${u}`} target="_blank" rel="noopener noreferrer"
+                        className="block truncate text-signal hover:underline">{u}</a>
+                    ))}
+                  </dd>
+                </div>
+              )}
             </dl>
           </Panel>
 

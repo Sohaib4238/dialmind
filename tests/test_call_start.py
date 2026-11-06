@@ -46,8 +46,9 @@ def settings(**kw) -> AgentSettings:
 cfg = agent_config.build_config(s)
 assert s.call_start.wait_seconds == 4 and s.call_start.greet_if_silent
 assert cfg["initial_message"] == '<break time="4s"/>{{silent_greeting}}', cfg["initial_message"]
-assert '"{{silent_greeting}}"' in cfg["instructions"] and "Never introduce yourself twice" in cfg["instructions"]
-assert s.fill(s.opening_line) in cfg["instructions"]
+assert '"{{silent_greeting}}"' in cfg["instructions"] and "never twice" in cfg["instructions"]
+assert 'Your introduction is exactly this line: "{{intro_line}}"' in cfg["instructions"]  # per call (agent_config.introduction)
+assert f'"{s.fill(s.silence.check_message)}" are never your introduction' in cfg["instructions"]  # the cut-off "Hello," of #38
 assert "voicemail tool" in cfg["instructions"]  # the voicemail rules stay
 off = settings(call_start={**vals["call_start"], "greet_if_silent": False})
 assert agent_config.build_config(off)["initial_message"] is None
@@ -63,14 +64,28 @@ for bad in (1, 9):
         pass
 print("config: pause + greeting in the welcome message, off = callee first, wait limited to 2-8 s")
 
-# 2. The greeting: with the lead's name; without one, no "is this ?"; a name can't add a speech tag.
+# 2. A silent callee only hears a short check ("Hello?"), never the introduction (History #38).
 empty = agent_config.lead_variables(None, s)
-assert agent_config.silent_greeting(s, {**empty, "lead_name": "Maria"}) == f"Hi, is this Maria? This is {s.caller_name} from {s.company_name}."
-assert agent_config.silent_greeting(s, empty) == f"This is {s.caller_name} from {s.company_name}."
-assert "<" not in agent_config.silent_greeting(s, {**empty, "lead_name": '<break time="9s"/>Bob'})
+assert s.call_start.silent_greeting == "Hello?"
+assert agent_config.silent_greeting(s, {**empty, "lead_name": "Maria"}) == "Hello?"
+assert agent_config.silent_greeting(s, empty) == "Hello?"
+named = settings(call_start={**vals["call_start"], "silent_greeting": "Hello? Is this {lead_name}?"})
+assert agent_config.silent_greeting(named, {**empty, "lead_name": "Maria"}) == "Hello? Is this Maria?"
+assert agent_config.silent_greeting(named, empty) == "Hello?"  # no name: that sentence is left out
+assert "<" not in agent_config.silent_greeting(named, {**empty, "lead_name": '<break time="9s"/>Bob'})
 only_name = settings(call_start={**vals["call_start"], "silent_greeting": "Is this {lead_name}?"})
-assert agent_config.silent_greeting(only_name, empty) == only_name.fill(s.opening_line, lead=empty)
-print("greeting: name left out cleanly when empty")
+assert agent_config.silent_greeting(only_name, empty) == "Hello?"  # never falls back to the introduction
+for bad in ("Hi, this is {caller_name} from {company_name}.", "Hello? We are {company_name}.",
+            "Hello, I hope you are having a really lovely day today?", "Two\nlines"):
+    try:
+        settings(call_start={**vals["call_start"], "silent_greeting": bad})
+        raise AssertionError(f"accepted {bad!r}")
+    except ValueError:
+        pass
+# The server's settings file still has the old default (a whole introduction): it loads as "Hello?".
+old_default = settings(call_start={**vals["call_start"], "silent_greeting": "Hi, is this {lead_name}? This is {caller_name} from {company_name}."})
+assert old_default.call_start.silent_greeting == "Hello?"
+print("silent callee: only \"Hello?\" (also from the old default), an introduction there is refused")
 
 # 3. An old settings file (the server's) has neither section: still valid, sound off, greeting on.
 old = yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -87,8 +102,8 @@ tr.last_turn_end_s = 0.0
 
 
 async def ingest() -> None:
-    calls.manager._ingest_turn(1, tr, {"role": "assistant", "text": '<break time="4s"/>Hi, is this Maria?',
-                                       "start_timestamp": 4.0, "end_timestamp": 6.0}, "poll")
+    calls.manager._ingest_turn(1, tr, {"role": "assistant", "text": '<break time="4s"/>Hello?',
+                                       "start_timestamp": 4.0, "end_timestamp": 4.6}, "poll")
     assert tr.unanswered_checkins == 0, "the greeting counted as a silence check-in"
     calls.manager._ingest_turn(1, tr, {"role": "assistant", "text": "Hello, can you hear me okay?",
                                        "start_timestamp": 12.0, "end_timestamp": 14.0}, "poll")
@@ -97,7 +112,7 @@ async def ingest() -> None:
 asyncio.run(ingest())
 with get_session() as db:
     texts = [e.text for e in db.exec(select(CallEvent).where(CallEvent.call_id == 1, CallEvent.kind == "transcript"))]
-assert texts == ["Hi, is this Maria?", "Hello, can you hear me okay?"], texts
+assert texts == ["Hello?", "Hello, can you hear me okay?"], texts
 print("transcript: no speech tag; the greeting isn't a check-in, a later silence is")
 
 # 4b. Without the greeting a first line after dead air is still a check-in (the old behaviour).
@@ -222,5 +237,33 @@ with TestClient(app) as client:
     assert client.get("/api/voice/ambience/nope").status_code == 404
     assert client.get("/api/voice/ambience/..%2F..%2Fmain").status_code == 404
 print("dashboard: form section, voice save + validation, preview")
+
+# The introduction (2026-11-05): source + need + business, missing parts left out, company only when asked
+from settings import OLD_OPENING_LINE, DEFAULT_OPENING_LINE  # noqa: E402
+
+assert settings(opening_line=OLD_OPENING_LINE).opening_line == DEFAULT_OPENING_LINE  # a server's old default moves over
+for bad, where in (("Hi[ there", "never closed"), ("Hi [a [b]]", "inside another"), ("Hi]", "not closed"),
+                   ("Hi, {source_line}\nIs now ok?", "one line")):
+    try:
+        settings(opening_line=bad)
+        raise AssertionError(f"accepted {bad!r}")
+    except ValueError as e:
+        assert where in str(e), str(e)
+try:
+    settings(main_script="Talk about {source_line}.")
+    raise AssertionError("accepted {source_line} outside the opening line")
+except ValueError as e:
+    assert "only be used in the opening line" in str(e), str(e)
+intro = agent_config.introduction
+caller = s.caller_name
+assert intro(s, {"lead_source": "LinkedIn Sales Navigator", "service_required": "SEO"}) ==     f"Hi, this is {caller}. I came across your business on LinkedIn Sales Navigator. Is now an okay time?"
+assert intro(s, {"lead_source": "Bark", "business_description": "roofing company"}) ==     f"Hi, this is {caller}. I saw your request on Bark for your roofing company. Is now an okay time?"
+assert intro(s, {}) == f"Hi, this is {caller}. Is now an okay time?"
+assert s.company_name not in intro(s, {"lead_source": "Bark", "service_required": "a logo", "business_name": "Bo's"})
+own = settings(opening_line="Hey[ {lead_name}], it's {caller_name}. {source_line} Got a minute?")
+assert intro(own, {"lead_name": "Maria", "lead_source": "Bark"}) == f"Hey Maria, it's {caller}. I saw your request on Bark. Got a minute?"
+assert intro(own, {}) == f"Hey, it's {caller}. Got a minute?"
+print("introduction: old default moved over; [optional] parts checked and left out when empty; request vs found source;"
+      " company name never in it; {source_line} only in the opening line")
 
 print("OK")

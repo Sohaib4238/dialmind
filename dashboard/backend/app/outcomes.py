@@ -14,22 +14,31 @@ import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-# outcome -> (label, lead status)
+# outcome -> (label, lead status). Labels are what the dashboard and the results sheet show (the sales team's
+# tags, 2026-11-05); the internal values never change.
 OUTCOMES = {
-    "interested": ("Interested", "interested"),
-    "not_now": ("Not now", "callback"),
-    "gatekeeper": ("Gatekeeper", "callback"),
-    "not_interested": ("Not interested", "not_interested"),
+    "interested": ("Interested – callback", "interested"),
+    "not_now": ("Callback", "callback"),
+    "gatekeeper": ("Callback (gatekeeper)", "callback"),
+    "not_interested": ("Rejected", "not_interested"),
     "do_not_contact": ("Do not contact", "do_not_contact"),
     "wrong_number": ("Wrong number", "bad_number"),
     "voicemail": ("Voicemail", "voicemail"),
-    "bad_line": ("Bad line", "bad_line"),
+    "bad_line": ("No answer (bad line)", "bad_line"),
     "no_answer": ("No answer", "no_answer"),
-    "failed": ("Failed", "failed"),
+    "failed": ("Call failed", "failed"),
     "needs_review": ("Needs review", "needs_review"),
-    "transferred": ("Transferred", "transferred"),
-    "transfer_declined": ("Supervisor busy", "callback"),
-    "transfer_failed": ("Transfer failed", "callback"),
+    "transferred": ("Connected – transferred", "transferred"),
+    "transfer_declined": ("Interested – callback", "callback"),
+    "transfer_failed": ("Interested – callback", "callback"),
+}
+# Lead status -> label (Leads page, results sheet). "handled_by_sales": the row is green/yellow in the sales sheet.
+STATUS_LABELS = {
+    "new": "New", "calling": "Calling", "interested": "Interested – callback", "callback": "Callback",
+    "not_interested": "Rejected", "needs_review": "Needs review", "voicemail": "Voicemail", "no_answer": "No answer",
+    "bad_line": "No answer (bad line)", "bad_number": "Wrong number", "do_not_contact": "Do not contact",
+    "not_a_fit": "Not a fit", "failed": "Call failed", "answered": "Answered", "transferred": "Connected – transferred",
+    "texted": "Texted", "handled_by_sales": "Handled by sales",
 }
 # What the AI may report during the call (record_outcome)
 AI_OUTCOMES = ("interested", "not_now", "not_interested", "do_not_contact", "gatekeeper", "wrong_number")

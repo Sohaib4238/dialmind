@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
-import { api, ApiError } from "@/lib/api"
+import { api, ApiError, IS_REMOTE } from "@/lib/api"
 import { formatPhone } from "@/lib/format"
 import { useLiveStatus, useLiveStream } from "@/lib/live"
 import type { SupervisorRequest } from "@/lib/types"
@@ -78,13 +78,28 @@ function useSoundUnlocked(): boolean {
   return ok
 }
 
-/** Pop-up on every open dashboard (this computer and the supervisor's laptop) when the AI asks for the supervisor. */
+/** Who is looking at this dashboard: a supervisor on the list (their own pop-up), or this computer / an admin. */
+function useViewer() {
+  const [me, setMe] = useState<{ key: string | null; onList: boolean } | null>(null)
+  const load = useCallback(() => {
+    api.supervisor().then((s) => setMe({ key: s.me ?? null, onList: !!s.me_supervisor })).catch(() => {})
+  }, [])
+  useEffect(load, [load])
+  useLiveStream((msg) => {
+    if (msg.type === "supervisor_settings") load()
+  })
+  return me
+}
+
+/** Pop-up for every supervisor the AI is ringing (all available ones at once), with a sound. The first Accept wins;
+ * the others' pop-up then closes ("taken by X"). This computer (no login) sees every request and can answer for one. */
 export function SupervisorPopup() {
   const [requests, setRequests] = useState<Record<number, SupervisorRequest>>({})
   const [busy, setBusy] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const soundOk = useSoundUnlocked()
   const answeredHere = useRef<Set<number>>(new Set())
+  const me = useViewer()
 
   const load = useCallback(() => {
     api.supervisorRequests()
@@ -112,9 +127,10 @@ export function SupervisorPopup() {
         const next = { ...prev }
         if (r.status === "waiting") next[r.call_id] = r
         else {
-          if (prev[r.call_id] && !answeredHere.current.has(r.call_id)) {
-            if (r.status === "accepted") toast.success(`${r.lead.lead_name || "The lead"}: accepted on another screen`)
+          if (prev[r.call_id] && mine(prev[r.call_id]) && !answeredHere.current.has(r.call_id)) {
+            if (r.status === "accepted") toast.success(`${r.lead.lead_name || "The lead"}: taken by ${r.taken_by || "another supervisor"}`)
             else if (r.status === "timeout") toast.message(`${r.lead.lead_name || "The lead"}: no answer in time, the AI is booking a callback`)
+            else if (r.status === "declined") toast.message(`${r.lead.lead_name || "The lead"}: everyone was busy, the AI is booking a callback`)
           }
           delete next[r.call_id]
         }
@@ -135,7 +151,14 @@ export function SupervisorPopup() {
     }
   })
 
-  const current = Object.values(requests).sort((a, b) => (a.requested_at ?? "").localeCompare(b.requested_at ?? ""))[0]
+  // Mine: I'm one of the supervisors it rings and I haven't said busy. This computer (no login): every open request.
+  const mine = (r: SupervisorRequest) => {
+    if (!me) return false
+    if (me.onList && me.key) return (r.offered ?? []).some((o) => o.key === me.key) && !(r.declined_by ?? []).includes(me.key)
+    return !IS_REMOTE && !answeredHere.current.has(r.call_id)
+  }
+  const current = Object.values(requests).filter(mine).sort((a, b) => (a.requested_at ?? "").localeCompare(b.requested_at ?? ""))[0]
+  const forWhom = current && !me?.onList ? (current.offered ?? []).filter((o) => !(current.declined_by ?? []).includes(o.key)) : []
 
   // chime + countdown + tab title while a request is open
   useEffect(() => {
@@ -157,15 +180,17 @@ export function SupervisorPopup() {
     }
   }, [current?.call_id]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const answer = async (accept: boolean) => {
+  const answer = async (accept: boolean, supervisor?: string) => {
     if (!current) return
     setBusy(true)
     answeredHere.current.add(current.call_id)
     try {
-      await api.answerRequest(current.call_id, accept)
-      if (accept) toast.success("Accepted. The AI is connecting the call to your phone now.", { duration: 8000 })
-      else toast.message("Marked busy. The AI will ask when you can call them back.")
+      const r = await api.answerRequest(current.call_id, accept, supervisor)
+      if (accept) toast.success(`Accepted. The AI is connecting the call to ${me?.onList ? "your" : `${r.taken_by}'s`} phone now.`, { duration: 8000 })
+      else if (r.status === "waiting") toast.message("Marked busy. The other supervisors can still take it.")
+      else toast.message("Marked busy. The AI will ask when they can be called back.")
     } catch (e) {
+      answeredHere.current.delete(current.call_id)
       toast.error(e instanceof ApiError ? e.message : "Couldn't send your answer")
       load()
     } finally {
@@ -204,9 +229,12 @@ export function SupervisorPopup() {
                 </div>
                 <div>
                   <h2 id="sup-title" className="text-[15px] font-semibold tracking-[-0.01em]">
-                    Interested lead: {current.lead.lead_name || formatPhone(current.lead.phone)}
+                    {current.direction === "inbound" ? "Calling in" : "Interested lead"}: {current.lead.lead_name || formatPhone(current.lead.phone)}
                   </h2>
-                  <p className="text-[12px] text-muted-foreground">The AI is keeping them on the line. Take the call?</p>
+                  <p className="text-[12px] text-muted-foreground">
+                    The AI is keeping them on the line. Take the call?
+                    {(current.offered?.length ?? 0) > 1 && ` Also ringing: ${current.offered!.filter((o) => o.key !== me?.key).map((o) => o.name).join(", ")}. First to accept gets it.`}
+                  </p>
                 </div>
               </div>
               {left != null && (
@@ -262,16 +290,33 @@ export function SupervisorPopup() {
               )}
             </div>
 
-            <div className="flex gap-2 border-t border-border px-5 py-4">
-              <Button className="flex-1" disabled={busy} onClick={() => answer(true)}>
-                <PhoneForwarded strokeWidth={1.5} />
-                Accept: ring my phone
-              </Button>
-              <Button className="flex-1" variant="outline" disabled={busy} onClick={() => answer(false)}>
-                <PhoneOff strokeWidth={1.5} />
-                Busy
-              </Button>
-            </div>
+            {me?.onList ? (
+              <div className="flex gap-2 border-t border-border px-5 py-4">
+                <Button className="flex-1" disabled={busy} onClick={() => answer(true)}>
+                  <PhoneForwarded strokeWidth={1.5} />
+                  Accept: ring my phone
+                </Button>
+                <Button className="flex-1" variant="outline" disabled={busy} onClick={() => answer(false)}>
+                  <PhoneOff strokeWidth={1.5} />
+                  Busy
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2 border-t border-border px-5 py-4">
+                {forWhom.map((o) => (
+                  <Button key={o.key} className="flex-1" disabled={busy} onClick={() => answer(true, o.key)}>
+                    <PhoneForwarded strokeWidth={1.5} />
+                    Accept for {o.name}
+                  </Button>
+                ))}
+                {forWhom.length === 1 && (
+                  <Button className="flex-1" variant="outline" disabled={busy} onClick={() => answer(false, forWhom[0].key)}>
+                    <PhoneOff strokeWidth={1.5} />
+                    Busy
+                  </Button>
+                )}
+              </div>
+            )}
           </motion.div>
         </motion.div>
       )}

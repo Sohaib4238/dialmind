@@ -22,9 +22,21 @@ company_website: ""
 # no email is sent while it's empty.
 company_address: ""
 
-# The first thing the agent says, right after the person picks up and says hello
-# (or after a few seconds of silence). The AI is told to say it exactly like this.
-opening_line: Hey, this is {caller_name} from {company_name}. Did I catch you at an okay time?
+# The AI's introduction, said once, right after the person says hello. {source_line} is where the lead came from
+# (see lead_sources). Parts in [square brackets] are left out when a detail in them is empty. Our company name
+# isn't in it on purpose: the AI says it only when they ask who's calling.
+opening_line: Hi, this is {caller_name}. {source_line} Is now an okay time?
+
+# How the introduction says where the lead came from (the sales sheet's "Source" column, {lead_source}).
+lead_sources:
+  # Sources where we found the business ourselves. Any other source is a request the lead made (Bark, Thumbtack...).
+  found_sources: LinkedIn, Facebook, Instagram
+  # A lead that asked for something. {business_name} falls back to a short business description ("roofing company").
+  request_line: I saw your request on {lead_source}[ for {service_required}][ for your {business_name}].
+  # A business we found ourselves.
+  found_line: I came across your business on {lead_source}.
+  # No source known.
+  no_source_line: '[I saw you were looking for help with {service_required}.]'
 
 # When the person picks up and says nothing.
 call_start:
@@ -32,8 +44,17 @@ call_start:
   greet_if_silent: true
   # How long it waits for their hello (2-8 seconds). If they speak sooner, it answers them right away.
   wait_seconds: 4
-  # What it says after the wait. A sentence with an empty lead detail is left out, so no name means no "is this...?".
-  silent_greeting: Hi, is this {lead_name}? This is {caller_name} from {company_name}.
+  # A short check if they stay silent, like "Hello?". Not the introduction: that comes once, after they speak.
+  silent_greeting: Hello?
+
+# Calls to our number: a lead calling back, or someone new. Off: nobody answers.
+inbound:
+  # The AI answers calls to our number. Needs a one-time Telnyx step (README: Running it for real).
+  enabled: false
+  # The first thing a caller hears. No lead details here: right after it, the AI looks up their number and greets a known lead by name.
+  greeting: Thanks for calling {company_name}, this is {caller_name}. How can I help you?
+  # What the AI finds out from a caller who isn't in our leads. It saves them as a new lead.
+  new_caller: Ask for their name, then their business name, then what they need help with, one question at a time. Then carry on like our normal call.
 
 # How the agent should sound. Applies to every reply.
 speaking_style: |
@@ -254,7 +275,7 @@ dialer:
   retry_gap_hours: 2
   # Pause the dialer after this many failed calls in a row.
   pause_after_failures: 3
-  # Stop the dialer when the estimated free Cartesia minutes left drop below this.
+  # Stop the dialer when the Cartesia minutes left this month (Health page) drop below this.
   min_free_minutes: 2
   # Voicemail: how many more tries. Each try is at a different time of day than the last one
   # (morning vs afternoon, in the lead's own time zone).

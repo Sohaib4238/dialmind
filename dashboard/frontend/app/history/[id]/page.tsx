@@ -93,7 +93,7 @@ export default function CallDetailPage() {
       {call ? (
         <PageHeader
           title={formatPhone(call.number)}
-          description={`${formatDateTime(call.created_at)} · ${call.simulated ? "Simulated" : call.source === "cli" ? "From terminal" : "From dashboard"}`}
+          description={`${formatDateTime(call.created_at)} · ${call.simulated ? "Simulated" : call.direction === "inbound" ? "Inbound: they called us" : call.source === "cli" ? "From terminal" : "From dashboard"}`}
           actions={isActive(call.status) ? <StatusPill status={call.status} /> : call.outcome ? <OutcomeTag outcome={call.outcome} messageLeft={call.vm_message_left} /> : <ResultTag result={call.result} />}
         />
       ) : (

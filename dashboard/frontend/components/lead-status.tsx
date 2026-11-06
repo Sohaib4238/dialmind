@@ -4,20 +4,21 @@ import { cn } from "@/lib/utils"
 export const LEAD_STATUS_LABEL: Record<LeadStatus, string> = {
   new: "New",
   calling: "Calling",
-  interested: "Interested",
+  interested: "Interested – callback",
   callback: "Callback",
-  not_interested: "Not interested",
+  not_interested: "Rejected",
   needs_review: "Needs review",
   voicemail: "Voicemail",
   no_answer: "No answer",
-  bad_line: "Bad line",
-  bad_number: "Bad number",
+  bad_line: "No answer (bad line)",
+  bad_number: "Wrong number",
   do_not_contact: "Do not contact",
   not_a_fit: "Not a fit",
-  failed: "Failed",
+  failed: "Call failed",
   answered: "Answered",
-  transferred: "Transferred",
+  transferred: "Connected – transferred",
   texted: "Texted",
+  handled_by_sales: "Handled by sales",
 }
 
 /** Statuses in the filter (legacy / later-phase ones only when a lead has them). */
@@ -41,6 +42,7 @@ const TONE: Record<LeadStatus, { pill: string; dot: string }> = {
   answered: { pill: "border-transparent bg-signal-soft text-signal", dot: "bg-signal" },
   transferred: { pill: "border-transparent bg-signal text-signal-fg", dot: "bg-signal-fg" },
   texted: { pill: "border-border text-foreground", dot: "bg-muted-foreground" },
+  handled_by_sales: { pill: "border-border text-muted-foreground", dot: "bg-signal" },
 }
 
 export function LeadStatusTag({ status, className }: { status: LeadStatus; className?: string }) {

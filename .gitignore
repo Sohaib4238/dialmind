@@ -8,6 +8,9 @@ dashboard_users.json.tmp
 *.key
 *.p12
 *.pfx
+google_service_account*.json
+*service-account*.json
+*service_account*.json
 
 # Runtime data: leads, call history, recordings, logs
 data/

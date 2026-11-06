@@ -131,7 +131,8 @@ with TestClient(app) as c:
     assert d["call"]["status"] == "ended" and d["call"]["reason"] == "Callee hung up" and d["call"]["duration_s"] == 42.0
 
     h = c.post("/api/health/check").json()
-    m = next(x for x in h["checks"] if x["name"] == "Cartesia minutes")
+    m = next(x for x in h["checks"] if x["name"] == "Cartesia balance")
+    assert "of $6.00 left" in m["detail"], m
     print("4. health:", m["detail"])
 
 print("ALL HANG-UP TESTS PASS")

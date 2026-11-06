@@ -54,7 +54,7 @@ export default function HistoryPage() {
 
   return (
     <>
-      <PageHeader title="History" description="Every call placed from here or from the terminal." />
+      <PageHeader title="History" description="Every call placed from here or from the terminal, and every call to our number (Inbound)." />
       <Panel>
         <div className={`${COLS} h-10 border-b border-border px-4 text-[12px] text-faint`}>
           <span>Time</span>
@@ -100,10 +100,14 @@ export default function HistoryPage() {
                   <span className="flex items-center gap-2">
                     <span className="font-mono tnum">{formatPhone(c.number)}</span>
                     {c.simulated && <Tag>Sim</Tag>}
+                    {c.direction === "inbound" && <Tag tone="signal">Inbound</Tag>}
                     {c.source === "cli" && <Tag>Terminal</Tag>}
                   </span>
                   <span>
                     {!isActive(c.status) && c.outcome ? <OutcomeTag outcome={c.outcome} messageLeft={c.vm_message_left} /> : <ResultTag result={c.result} active={isActive(c.status)} />}
+                    {c.transfer_to_name && ["accepted", "transferring", "transferred"].includes(c.transfer_status ?? "") && (
+                      <span className="ml-1.5 text-[11px] text-muted-foreground" title="The supervisor who took the call">→ {c.transfer_to_name}</span>
+                    )}
                   </span>
                   <span title={emails[c.id] ? `${TEMPLATE_LABEL[emails[c.id].template]} email: ${emails[c.id].detail || emails[c.id].to_email}` : undefined}>
                     {emails[c.id] ? <EmailStatusTag status={emails[c.id].status} /> : <span className="text-faint">–</span>}

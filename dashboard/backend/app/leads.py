@@ -261,7 +261,8 @@ def import_csv(text: str, filename: str = "") -> dict:
 
 # ---- queries -------------------------------------------------------------------------
 
-def list_leads(q: str = "", status: str = "", limit: int = 500, offset: int = 0) -> dict:
+def list_leads(q: str = "", status: str = "", limit: int = 500, offset: int = 0, sort: str = "sheet") -> dict:
+    """sort: sheet (the sales sheet's order, first tab first; other leads after) / recent (last change first)."""
     with get_session() as s:
         stmt = select(Lead)
         if status:
@@ -271,12 +272,19 @@ def list_leads(q: str = "", status: str = "", limit: int = 500, offset: int = 0)
             digits = re.sub(r"\D", "", q)
             conds = [Lead.name.ilike(like), Lead.business.ilike(like), Lead.city.ilike(like), Lead.location.ilike(like),
                      Lead.service_required.ilike(like), Lead.business_description.ilike(like),
-                     Lead.job_description.ilike(like), Lead.notes.ilike(like), Lead.email.ilike(like)]
+                     Lead.job_description.ilike(like), Lead.notes.ilike(like), Lead.email.ilike(like),
+                     Lead.lead_source.ilike(like), Lead.additional_info.ilike(like), Lead.sheet_tab.ilike(like)]
             if len(digits) >= 3:
                 conds.append(Lead.phone.like(f"%{digits}%"))
             stmt = stmt.where(or_(*conds))
         total = s.exec(select(func.count()).select_from(stmt.subquery())).one()
-        rows = s.exec(stmt.order_by(Lead.updated_at.desc(), Lead.id.desc()).offset(offset).limit(min(limit, 2000))).all()
+        if sort == "recent":
+            order = [Lead.updated_at.desc(), Lead.id.desc()]
+        else:
+            from app.sheet_sync import sql_sheet_order  # sheet_sync imports this module
+
+            order = sql_sheet_order()
+        rows = s.exec(stmt.order_by(*order).offset(offset).limit(min(limit, 2000))).all()
     return {"leads": [lead_to_dict(x) for x in rows], "total": total, "counts": counts()}
 
 
@@ -324,6 +332,8 @@ def _log(s, lead_id: int, kind: str, text_: str, **data) -> None:
 
 
 def _status_from_calls(s, lead: Lead) -> str:
+    if lead.sales_handled:
+        return "handled_by_sales"
     last = s.get(Call, lead.last_call_id) if lead.last_call_id else None
     if last is None:
         return "not_a_fit" if _not_a_fit(lead) else "new"
@@ -413,6 +423,7 @@ def set_dnc(lead_id: int, dnc: bool, reason: str = "") -> dict:
         old = lead.status
         lead.status = "do_not_contact" if dnc else _status_from_calls(s, lead)
         lead.updated_at = utcnow()
+        lead.results_dirty = lead.attempts > 0  # rows exist only for leads we've called
         s.add(lead)
         _log(s, lead.id, "dnc", f"Marked Do not contact: {lead.dnc_reason}" if dnc else "Removed from Do not contact",
              old_status=old, new_status=lead.status)
@@ -451,7 +462,52 @@ def dnc_block_reason(phone: str) -> str | None:
 def dnc_block_reason_for_lead(lead_id: int) -> str | None:
     with get_session() as s:
         lead = s.get(Lead, lead_id)
-    return dnc_block_reason(lead.phone) if lead else "Lead not found"
+    if lead is None:
+        return "Lead not found"
+    return dnc_block_reason(lead.phone) or sales_block_reason(lead)
+
+
+def sales_block_reason(lead: Lead | None) -> str | None:
+    """The sales team coloured this lead's row green/yellow: we never call it (sheet_sync.py)."""
+    if lead is not None and lead.sales_handled:
+        who = f" ({lead.name})" if lead.name else ""
+        return (f"{format_phone(lead.phone)}{who} is handled by the sales team (its row is coloured in their sheet). "
+                "Not calling.")
+    return None
+
+
+def set_sales_handled(lead_id: int, handled: bool, reason: str = "") -> dict:
+    """Mark / clear "Handled by sales" (the sheet sync marks it; an admin may clear it on the lead page; the next sync
+    marks it again while the row is still coloured). DNC still wins over it."""
+    with get_session() as s:
+        lead = s.get(Lead, lead_id)
+        if lead is None:
+            raise LeadError("Lead not found")
+        changed = mark_sales_handled(s, lead, handled, reason or ("Marked by hand" if handled else "Cleared by hand"))
+        s.commit()
+        s.refresh(lead)
+    if changed:
+        _publish(lead)
+    return lead_to_dict(lead)
+
+
+def mark_sales_handled(s, lead: Lead, handled: bool, reason: str) -> bool:
+    """In an open session; True if it changed. Clears any callback (the sales team has the lead now)."""
+    if bool(lead.sales_handled) == handled:
+        return False
+    old = lead.status
+    lead.sales_handled = handled
+    lead.sales_handled_at = utcnow() if handled else None
+    if handled:
+        lead.callback_at, lead.callback_note = None, ""
+    if not lead.dnc:
+        lead.status = "handled_by_sales" if handled else _status_from_calls(s, lead)
+    lead.updated_at = utcnow()
+    lead.results_dirty = lead.attempts > 0
+    s.add(lead)
+    _log(s, lead.id, "status", ("Handled by sales: " if handled else "No longer handled by sales: ") + reason,
+         old_status=old, new_status=lead.status)
+    return True
 
 
 # ---- call hooks (called by the call manager) -----------------------------------------
@@ -474,6 +530,73 @@ def on_call_started(call: Call) -> None:
         s.commit()
         s.refresh(lead)
     _publish(lead)
+
+
+def on_inbound_call(call: Call) -> None:
+    """The lead called us: the call counts for its status, but isn't one of our dialing attempts."""
+    if not call.lead_id:
+        return
+    with get_session() as s:
+        lead = s.get(Lead, call.lead_id)
+        if lead is None:
+            return
+        lead.last_call_at = utcnow()
+        lead.last_call_id = call.id
+        if not lead.dnc:
+            lead.status = "calling"
+        lead.updated_at = utcnow()
+        s.add(lead)
+        _log(s, lead.id, "call", f"Inbound call #{call.id}: they called us", call_id=call.id, direction="inbound")
+        s.commit()
+        s.refresh(lead)
+    _publish(lead)
+
+
+INBOUND_SOURCE = "inbound call"
+CALLER_FIELDS = {"name": "name", "business_name": "business", "service": "service_required", "location": "location"}
+
+
+def create_inbound_lead(phone: str, fields: dict, call_id: int) -> Lead:
+    """A new caller (save_caller tool): a new lead from what they said on the call."""
+    now = utcnow()
+    with get_session() as s:
+        lead = Lead(phone=phone, source=INBOUND_SOURCE, status="new", created_at=now, updated_at=now,
+                    notes=fields.get("note", ""), **{col: fields.get(k, "") for k, col in CALLER_FIELDS.items()})
+        s.add(lead)
+        s.flush()
+        _log(s, lead.id, "imported", f"New lead from inbound call #{call_id}", call_id=call_id)
+        s.commit()
+        s.refresh(lead)
+    _publish(lead)
+    return lead
+
+
+def fill_from_caller(lead_id: int, fields: dict, call_id: int) -> int:
+    """What a caller said about themselves: fills empty fields (a lead made by an inbound call: any field)."""
+    with get_session() as s:
+        lead = s.get(Lead, lead_id)
+        if lead is None:
+            return lead_id
+        ours = lead.source == INBOUND_SOURCE
+        changed = []
+        for k, col in CALLER_FIELDS.items():
+            v = fields.get(k, "")
+            if v and getattr(lead, col) != v and (ours or not getattr(lead, col)):
+                setattr(lead, col, v)
+                changed.append(col.replace("_", " "))
+        note = fields.get("note", "")
+        if note and note not in (lead.notes or ""):
+            lead.notes = (f"{lead.notes}\n" if lead.notes else "") + f"Call #{call_id}: {note}"
+            changed.append("notes")
+        if changed:
+            lead.updated_at = utcnow()
+            s.add(lead)
+            _log(s, lead.id, "note", f"From inbound call #{call_id}: " + ", ".join(changed), call_id=call_id)
+            s.commit()
+            s.refresh(lead)
+    if changed:
+        _publish(lead)
+    return lead_id
 
 
 def on_call_finished(call: Call) -> None:
@@ -515,11 +638,14 @@ def on_call_finished(call: Call) -> None:
                     lead.callback_at = now + timedelta(hours=gap_hours)
             else:
                 lead.callback_at, lead.callback_note, lead.callback_count = None, "", 0
-            if not lead.dnc:
+            if not lead.dnc and not lead.sales_handled:
                 lead.status = new
         if outcome == "do_not_contact" and not lead.dnc:
             _mark_dnc(s, lead, f"Call #{call.id}: " + (call.outcome_note or "asked not to be contacted"))
+        if lead.dnc or lead.sales_handled:  # never a callback for Do not contact / a lead the sales team has
+            lead.callback_at, lead.callback_note = None, ""
         lead.updated_at = now
+        lead.results_dirty = True  # its row in the results sheet (results_sheet.py)
         s.add(lead)
         what = outcomes.label(outcome) + (f" ({call.outcome_note})" if call.outcome_note else "") + (f"; {note}" if note else "")
         if outcome == "voicemail":
@@ -548,6 +674,9 @@ def set_outcome(lead_id: int, outcome: str, note: str = "", callback_time: str =
             raise LeadError("Lead not found")
         if lead.dnc and outcome != "do_not_contact":
             raise LeadError("This lead is on Do not contact. Remove it from the list first.")
+        if lead.sales_handled:
+            raise LeadError("The sales team is handling this lead (green/yellow in their sheet). Clear "
+                            "\"Handled by sales\" first.")
         callback_at = None
         if outcome in outcomes.CALLBACK_OUTCOMES:
             tz_name, _ = lead_timezone(lead.location, lead.phone)
@@ -569,6 +698,7 @@ def set_outcome(lead_id: int, outcome: str, note: str = "", callback_time: str =
         lead.status = outcomes.lead_status(outcome)
         lead.callback_at, lead.callback_note = callback_at, (note if callback_at else "")
         lead.callback_count = 1 if callback_at else 0
+        lead.results_dirty = True
         if outcome == "do_not_contact" and not lead.dnc:
             _mark_dnc(s, lead, "Set by hand" + (f": {note}" if note else ""))
         lead.updated_at = now

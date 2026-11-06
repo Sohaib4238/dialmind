@@ -2,20 +2,21 @@ import type { Call, Outcome } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 export const OUTCOME_LABEL: Record<Outcome, string> = {
-  interested: "Interested",
-  not_now: "Not now",
-  gatekeeper: "Gatekeeper",
-  not_interested: "Not interested",
+  // The sales team's tags (same as the results sheet); the internal values never change.
+  interested: "Interested – callback",
+  not_now: "Callback",
+  gatekeeper: "Callback (gatekeeper)",
+  not_interested: "Rejected",
   do_not_contact: "Do not contact",
   wrong_number: "Wrong number",
   voicemail: "Voicemail",
-  bad_line: "Bad line",
+  bad_line: "No answer (bad line)",
   no_answer: "No answer",
-  failed: "Failed",
+  failed: "Call failed",
   needs_review: "Needs review",
-  transferred: "Transferred",
-  transfer_declined: "Supervisor busy",
-  transfer_failed: "Transfer failed",
+  transferred: "Connected – transferred",
+  transfer_declined: "Interested – callback",
+  transfer_failed: "Interested – callback",
 }
 
 /** Outcomes that can be set by hand on the lead page (the AI's, plus transferred and needs review). */

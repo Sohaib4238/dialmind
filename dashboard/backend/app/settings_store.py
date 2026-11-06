@@ -41,10 +41,19 @@ LABELS = {
     "company_website": "Website",
     "company_address": "Business address",
     "opening_line": "Opening line",
+    "lead_sources": "Where the lead came from (introduction)",
+    "found_sources": "Sources where we found them",
+    "request_line": "They asked on a site (Bark...)",
+    "found_line": "We found their business",
+    "no_source_line": "No source known",
     "call_start": "Call start (who speaks first)",
     "greet_if_silent": "Greet first if they stay silent",
     "wait_seconds": "Wait for their hello (seconds)",
-    "silent_greeting": "Greeting after the wait",
+    "silent_greeting": "If they stay silent, say",
+    "inbound": "Inbound calls",
+    "inbound.enabled": "Answer calls to our number",
+    "inbound.greeting": "Inbound greeting",
+    "inbound.new_caller": "New caller (not in our leads)",
     "speaking_style": "Speaking style",
     "main_script": "Main script",
     "ai_receptionist_script": "AI receptionist script",
@@ -84,7 +93,7 @@ LABELS = {
     "max_retries": "Extra tries",
     "retry_gap_hours": "Hours between tries",
     "pause_after_failures": "Pause after failed calls in a row",
-    "min_free_minutes": "Stop below free minutes",
+    "min_free_minutes": "Stop below minutes left",
     "voicemail_retries": "Voicemail: extra tries",
     "callback_default_days": "Callback after (days)",
     "max_callbacks": "Max callbacks in a row",
@@ -108,12 +117,32 @@ OPTION_LABELS = {
 
 # Help for sections newer than a server's own settings file (its comments come from before they existed).
 DEFAULT_HELP = {
+    "opening_line": ("The AI's introduction, said once, right after the person says hello. {source_line} is where the "
+                     "lead came from (see below). Parts in [square brackets] are left out when a detail in them is empty. "
+                     "Our company name isn't in it on purpose: the AI says it only when they ask who's calling."),
+    "lead_sources": "How the introduction says where the lead came from (the sales sheet's \"Source\" column, {lead_source}).",
+    "lead_sources.found_sources": ("Sources where we found the business ourselves. Any other source is a request the "
+                                   "lead made (Bark, Thumbtack...)."),
+    "lead_sources.request_line": ("A lead that asked for something. {business_name} falls back to a short business "
+                                  "description (\"roofing company\")."),
+    "lead_sources.found_line": "A business we found ourselves.",
+    "lead_sources.no_source_line": "No source known.",
     "call_start": "When the person picks up and says nothing.",
-    "call_start.greet_if_silent": "The AI gives them a moment to say hello, then greets them itself. Off: it waits until they speak.",
+    "call_start.greet_if_silent": ("The AI gives them a moment to say hello. If they don't, it checks with a short "
+                                   "\"Hello?\". Off: it waits until they speak."),
     "call_start.wait_seconds": "How long it waits for their hello (2-8 seconds). If they speak sooner, it answers them right away.",
-    "call_start.silent_greeting": "What it says after the wait. A sentence with an empty lead detail is left out, so no name means no \"is this...?\".",
+    "call_start.silent_greeting": ("A short check if they stay silent, like \"Hello?\". Not the introduction: that "
+                                   "comes once, after they speak."),
     "voice.ambience.volume_percent": "Keep it low so the voice stays clear.",
+    "inbound": "Calls to our number: a lead calling back, or someone new. Off: nobody answers.",
+    "inbound.enabled": "The AI answers calls to our number. Needs a one-time Telnyx step (README: Running it for real).",
+    "inbound.greeting": ("The first thing a caller hears. No lead details here: right after it, the AI looks up their "
+                         "number and greets a known lead by name."),
+    "inbound.new_caller": "What the AI finds out from a caller who isn't in our leads. It saves them as a new lead.",
 }
+
+# Help that wins over an older settings file's own comment (its meaning changed).
+FIXED_HELP = {k: DEFAULT_HELP[k] for k in ("call_start.greet_if_silent", "call_start.silent_greeting", "opening_line")}
 
 _KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*):")
 
@@ -225,7 +254,8 @@ def read() -> dict:
         values = yaml.safe_load(text) or {}
         error = str(e)
     return {
-        "fields": [f for f in _field_spec(AgentSettings, "", {**DEFAULT_HELP, **parse_help(text)}) if f["key"] not in OWN_PAGE],
+        "fields": [f for f in _field_spec(AgentSettings, "", {**DEFAULT_HELP, **parse_help(text), **FIXED_HELP})
+                   if f["key"] not in OWN_PAGE],
         "values": values,
         "version": file_version(),
         "file_error": error,
@@ -239,7 +269,7 @@ def _validation_errors(e: ValidationError) -> list[dict]:
         loc = [str(p) for p in err["loc"]]
         msg = err["msg"].removeprefix("Value error, ")
         # The placeholder check reports its own path inside the message.
-        m = re.match(r"^([\w.\[\]]+): (unknown placeholder.*|a \{ or \} doesn't.*)", msg)
+        m = re.match(r"^([\w.\[\]]+): (unknown placeholder.*|a \{ or \} doesn't.*|\{\w+\} can only be used.*)", msg)
         if m:
             loc, msg = [m.group(1)], m.group(2)
         out.append({"path": ".".join(loc), "message": msg})

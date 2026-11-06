@@ -14,7 +14,7 @@ import time
 
 import aiohttp
 
-from app import cartesia, cartesia_setup, sms, standby
+from app import cartesia, cartesia_setup, inbound, sms, standby
 
 logger = logging.getLogger("dashboard.tunnel")
 
@@ -110,6 +110,8 @@ async def check_once(http: aiohttp.ClientSession) -> None:
         # Phase 7b: replies to our texts (STOP) come in through our own messaging profile's webhook
         state["sms_webhook"] = await asyncio.to_thread(sms.ensure_webhook, url)
         logger.info("messaging webhook: %s", state["sms_webhook"]["detail"])
+    if state["webhook"]:  # inbound calls: switch on/off to match the settings (app/inbound.py)
+        await inbound.maybe_apply(url)
     # A new trycloudflare hostname can take a few seconds to resolve.
     state["reachable"] = await _public_ping(http, url)
 

@@ -30,7 +30,7 @@ from env_utils import file_log  # noqa: E402
 
 # Every call step, webhook and Cartesia error ends up in logs/backend.log.
 file_log("backend.log")
-from app import agent_config, ambience, auth, cartesia, cartesia_setup, emails, health, leads, settings_store, sms, standby, storage, supervisor, telnyx_events, test_mode, tunnel, unsubscribe, voices  # noqa: E402
+from app import agent_config, ambience, auth, cartesia, cartesia_setup, emails, gsheets, health, inbound, leads, results_sheet, settings_store, sheet_sync, sms, standby, storage, supervisor, telnyx_events, test_mode, tunnel, unsubscribe, voices  # noqa: E402
 from settings import SettingsError  # noqa: E402
 from app.dialer import AutoDialer  # noqa: E402
 from app.bus import bus  # noqa: E402
@@ -45,7 +45,7 @@ FRONTEND_ORIGINS = ["http://127.0.0.1:3000", "http://localhost:3000",
                     *filter(None, os.getenv("DASHBOARD_EXTRA_ORIGINS", "").split(","))]  # e.g. a demo frontend on :3001
 # Paths that may be reached through a tunnel without a login (each checks its own secret).
 PUBLIC_PATHS = {"/api/cartesia/webhook", "/api/cartesia/tools/record_outcome", "/api/cartesia/tools/request_supervisor",
-                "/api/cartesia/tools/collect_email",
+                "/api/cartesia/tools/collect_email", "/api/cartesia/tools/lookup_caller", "/api/cartesia/tools/save_caller",
                 "/api/telnyx/webhook", "/api/telnyx/messaging", "/api/public/ping", "/api/auth/login", "/api/auth/me", "/api/auth/logout"}
 
 
@@ -60,7 +60,9 @@ async def lifespan(app: FastAPI):
     inbox = asyncio.create_task(unsubscribe.watch())  # STOP replies -> Do not contact (off unless IMAP is set up)
     texts = asyncio.create_task(sms.watch())  # queued follow-up texts, sent when the lead's calling hours start
     disk = asyncio.create_task(storage.watch())  # deletes recordings past the keep period
+    sheets = asyncio.create_task(sheet_sync.watch())  # sales sheet every N minutes (if on) + the results sheet
     yield
+    sheets.cancel()
     watcher.cancel()
     inbox.cancel()
     texts.cancel()
@@ -241,8 +243,8 @@ async def leads_import(body: LeadsCsv) -> dict:
 
 
 @app.get("/api/leads")
-def list_leads(q: str = "", status: str = "", limit: int = 500, offset: int = 0) -> dict:
-    return leads.list_leads(q, status, limit, offset)
+def list_leads(q: str = "", status: str = "", limit: int = 500, offset: int = 0, sort: str = "sheet") -> dict:
+    return leads.list_leads(q, status, limit, offset, sort)
 
 
 @app.get("/api/leads/counts")
@@ -296,6 +298,77 @@ async def set_lead_outcome(lead_id: int, body: OutcomeChange) -> dict:
         return leads.set_outcome(lead_id, body.outcome, body.note, body.callback_time)
     except leads.LeadError as e:
         raise HTTPException(404 if "not found" in str(e) else 400, str(e))
+
+
+class SalesHandled(BaseModel):
+    handled: bool
+
+
+@app.post("/api/leads/{lead_id}/sales-handled")
+async def lead_sales_handled(lead_id: int, body: SalesHandled) -> dict:
+    """Clear (or set) "Handled by sales" by hand. The next sheet sync sets it again while the row is still coloured."""
+    try:
+        return leads.set_sales_handled(lead_id, body.handled)
+    except leads.LeadError as e:
+        raise HTTPException(404, str(e))
+
+
+# ---- Google Sheets: the sales team's leads (read only) + our results sheet ----------------------
+
+@app.get("/api/sheets")
+def sheets_status() -> dict:
+    return sheet_sync.status()
+
+
+class SheetSettings(BaseModel):
+    enabled: bool | None = None
+    sales_sheet: str | None = None
+    tabs: list[str] | None = None
+    sync_minutes: int | None = None
+    handled_colors: list[str] | None = None
+    handled_action: str | None = None
+    results_sheet: str | None = None
+    results_tab: str | None = None
+    results_timezone: str | None = None
+    dialer_order: str | None = None
+
+
+@app.put("/api/sheets")
+async def save_sheets(body: SheetSettings) -> dict:
+    try:
+        return sheet_sync.save(body.model_dump(exclude_none=True))
+    except sheet_sync.SheetSettingsError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/sheets/sync")
+async def sheets_sync_now() -> dict:
+    """Read the sales sheet now: new leads in, colours applied. Never starts the dialer."""
+    res = await sheet_sync.sync_now("manual")
+    if not res.get("ok") and not res.get("at"):  # not ready / already running: nothing was read
+        raise HTTPException(409, res["error"])
+    return res
+
+
+@app.post("/api/sheets/recheck-colors")
+async def sheets_recheck_colors() -> dict:
+    """Read the sales sheet and apply ONLY the colour rule to leads we already have (green / yellow / red rows ->
+    Handled by sales). Nothing is imported, filled in or moved."""
+    res = await sheet_sync.sync_now("colours", colors_only=True)
+    if not res.get("ok") and not res.get("at"):
+        raise HTTPException(409, res["error"])
+    return res
+
+
+@app.post("/api/sheets/results/rewrite")
+async def sheets_rewrite_results() -> dict:
+    """Write every called lead's row to the results sheet again (e.g. after setting it up)."""
+    if not gsheets.sheet_id_from(sheet_sync.load()["results_sheet"]):
+        raise HTTPException(400, "Set the results sheet link first.")
+    n = await asyncio.to_thread(results_sheet.mark_all_called)
+    sheet_sync._save_state(results={})  # try at once, even right after a failure
+    sheet_sync.wake()
+    return {"ok": True, "queued": n}
 
 
 @app.post("/api/leads/{lead_id}/call-anyway")
@@ -419,6 +492,21 @@ class TestMode(BaseModel):
     confirm: bool = False
 
 
+class DialerOrder(BaseModel):
+    order: str
+
+
+@app.post("/api/dialer/order")
+async def dialer_order(body: DialerOrder) -> dict:
+    """New leads: sheet order (top to bottom, first tab first) or newest first."""
+    try:
+        sheet_sync.set_dialer_order(body.order)
+    except sheet_sync.SheetSettingsError as e:
+        raise HTTPException(400, str(e))
+    dialer.publish()
+    return dialer.snapshot()
+
+
 @app.post("/api/dialer/test-mode")
 async def dialer_test_mode(body: TestMode) -> dict:
     if not body.enabled and not body.confirm:
@@ -462,14 +550,28 @@ async def request_supervisor_tool(request: Request) -> Response:
     """Webhook tool: ask the supervisor to take this call. Each use waits a few seconds for his
     Accept / Busy, then replies AVAILABLE / WAITING / NOT AVAILABLE (same Bearer secret as record_outcome)."""
     payload = await _tool_payload(request)
-    reply = await manager.request_supervisor_tool(payload)
-    return Response(reply, media_type="text/plain")
+    # JSON: Cartesia saves its transfer_number (the supervisor who accepted) into {{transfer_number}}
+    return JSONResponse(await manager.request_supervisor_tool(payload))
 
 
 @app.post("/api/cartesia/tools/collect_email")
 async def collect_email_tool(request: Request) -> Response:
     """Webhook tool: the lead's email address, read back and confirmed (same Bearer secret as record_outcome)."""
     reply = manager.collect_email_tool(await _tool_payload(request))
+    return Response(reply, media_type="text/plain")
+
+
+@app.post("/api/cartesia/tools/lookup_caller")
+async def lookup_caller_tool(request: Request) -> Response:
+    """Webhook tool (inbound calls): who is calling, from our leads (same Bearer secret as record_outcome)."""
+    reply = await manager.lookup_caller_tool(await _tool_payload(request))
+    return Response(reply, media_type="text/plain")
+
+
+@app.post("/api/cartesia/tools/save_caller")
+async def save_caller_tool(request: Request) -> Response:
+    """Webhook tool (inbound calls): a new caller's details -> a new lead (same Bearer secret)."""
+    reply = await manager.save_caller_tool(await _tool_payload(request))
     return Response(reply, media_type="text/plain")
 
 
@@ -491,39 +593,98 @@ async def _tool_payload(request: Request) -> dict:
 
 # ---- supervisor (Phase 6) -------------------------------------------------------------
 
-class SupervisorSettings(BaseModel):
+class SupervisorWait(BaseModel):
+    wait_seconds: int
+
+
+class SupervisorPerson(BaseModel):
+    key: str | None = None  # a new login name (rename)
+    name: str | None = None
     phone: str | None = None
     available: bool | None = None
-    wait_seconds: int | None = None
     hours: dict | None = None
 
 
 class Availability(BaseModel):
     available: bool
+    key: str | None = None  # admin / this computer: whose switch. A supervisor always flips their own.
 
 
 class Answer(BaseModel):
     accept: bool
+    supervisor: str | None = None  # admin / this computer, not on the list themselves: answer for this one
+
+
+def _viewer(request: Request) -> tuple[str | None, bool]:
+    """(login name or None on this computer, may act as admin)."""
+    if not auth.is_remote(request):
+        return None, True
+    return auth.session_user(request), auth.session_role(request) == "admin"
 
 
 @app.get("/api/supervisor")
-def supervisor_settings() -> dict:
+def supervisor_settings(request: Request) -> dict:
+    user, admin = _viewer(request)
+    from app import cartesia_setup as cs
+
+    st = cs._state()
     return {**supervisor.public_state(), "dashboard_url": tunnel.state.get("dashboard_url"),
-            "login_configured": auth.configured(), "transfer_ready": agent_config.supervisor_enabled()}
+            "login_configured": auth.configured(), "transfer_ready": agent_config.supervisor_enabled(),
+            "me": user, "is_admin": admin, "me_supervisor": bool(supervisor.person(user)),
+            "logins": sorted(auth.users()) if admin else [],
+            "assignments": st.get("supervisor_assignments"), "assignments_error": st.get("supervisor_assignments_error") or ""}
+
+
+def _after_people_change(old_phones: list[str]) -> None:
+    if supervisor.phones() != old_phones and inbound.enabled():  # the inbound agent has the phones in its transfer tool
+        asyncio.create_task(inbound.apply("supervisor phones changed"))
 
 
 @app.put("/api/supervisor")
-def save_supervisor_settings(body: SupervisorSettings) -> dict:
+async def save_supervisor_wait(body: SupervisorWait) -> dict:
     try:
-        return supervisor.save(body.model_dump(exclude_none=True))
+        return supervisor.save_wait(body.wait_seconds)
     except supervisor.SupervisorError as e:
         raise HTTPException(400, str(e))
 
 
+@app.put("/api/supervisor/people/{key}")
+async def save_supervisor_person(key: str, body: SupervisorPerson) -> dict:
+    """Add or change one supervisor (admin only: auth.allowed)."""
+    old = supervisor.phones()
+    try:
+        res = supervisor.save_person(key, body.model_dump(exclude_none=True))
+    except supervisor.SupervisorError as e:
+        raise HTTPException(400, str(e))
+    _after_people_change(old)
+    return res
+
+
+@app.delete("/api/supervisor/people/{key}")
+async def delete_supervisor_person(key: str) -> dict:
+    old = supervisor.phones()
+    try:
+        res = supervisor.remove_person(key)
+    except supervisor.SupervisorError as e:
+        raise HTTPException(404, str(e))
+    _after_people_change(old)
+    return res
+
+
 @app.post("/api/supervisor/availability")
-def set_supervisor_availability(body: Availability) -> dict:
-    """The "available" switch alone (the supervisor may flip it from his own laptop)."""
-    return supervisor.save({"available": body.available})
+async def set_supervisor_availability(body: Availability, request: Request) -> dict:
+    """A supervisor's own "available" switch (also from their laptop). An admin may flip anyone's (key)."""
+    user, admin = _viewer(request)
+    key = body.key if admin and body.key else user
+    if not key:
+        people = supervisor.load()["people"]
+        if len(people) != 1:
+            raise HTTPException(400, "Say whose switch: there's more than one supervisor.")
+        key = people[0]["key"]
+    try:
+        return supervisor.set_available(key, body.available)
+    except supervisor.SupervisorError as e:
+        raise HTTPException(403 if not admin else 400, str(e))
 
 
 @app.get("/api/supervisor/requests")
@@ -533,10 +694,11 @@ def supervisor_requests() -> list[dict]:
 
 @app.post("/api/supervisor/requests/{call_id}/answer")
 async def answer_supervisor_request(call_id: int, body: Answer, request: Request) -> dict:
-    """Accept / Busy. async: it wakes the AI's waiting request_supervisor on the same event loop."""
-    who = auth.session_user(request) or "dashboard"
+    """Accept / Busy. async: it wakes the AI's waiting request_supervisor on the same event loop. The first Accept
+    wins and the call goes to that supervisor's phone."""
+    user, admin = _viewer(request)
     try:
-        return manager.answer_supervisor(call_id, body.accept, who)
+        return manager.answer_supervisor(call_id, body.accept, user=user, as_key=body.supervisor, admin=admin)
     except CallError as e:
         raise HTTPException(409, str(e))
 
@@ -642,7 +804,7 @@ async def _sync_agent(reason: str) -> dict:
 
 @app.get("/api/settings")
 def get_settings() -> dict:
-    return {**settings_store.read(), "sync": cartesia_setup.sync_status()}
+    return {**settings_store.read(), "sync": cartesia_setup.sync_status(), "inbound": inbound.status()}
 
 
 class SaveSettings(BaseModel):
@@ -659,7 +821,7 @@ async def save_settings(body: SaveSettings) -> dict:
     except settings_store.SettingsConflict as e:
         raise HTTPException(409, str(e))
     leads.apply_service_fit()  # the service-fit keywords may have changed
-    return {**res, "cartesia": await _sync_agent("instructions saved")}
+    return {**res, "cartesia": await _sync_agent("instructions saved"), "inbound": await inbound.apply("instructions saved")}
 
 
 # ---- voice (Cartesia) ---------------------------------------------------------------
@@ -701,13 +863,13 @@ async def voice_preview(voice_id: str) -> Response:
 # Stands in for the lead's details when the opening line is spoken as a voice sample.
 SAMPLE_LEAD = {"lead_name": "Maria", "business_name": "Bloom Boutique", "service_required": "a new website",
                "business_description": "a dress boutique", "job_description": "an online store", "location": "Miami",
-               "specialist_title": "our senior web designer"}
+               "specialist_title": "our senior web designer", "lead_source": "Bark"}
 
 
 def _opening_line() -> str:
     try:
         s = settings_store.AgentSettings.model_validate(settings_store.read()["values"])
-        return s.fill(s.opening_line, lead=SAMPLE_LEAD)
+        return agent_config.introduction(s, SAMPLE_LEAD)
     except Exception:  # noqa: BLE001 - invalid settings: fall back to a neutral sentence
         return "Hi, this is a quick sample of my voice. How does it sound?"
 
@@ -776,6 +938,8 @@ async def save_voice(body: SaveVoice) -> dict:
         raise HTTPException(422, {"errors": e.errors})
     except settings_store.SettingsConflict as e:
         raise HTTPException(409, str(e))
+    if inbound.enabled():  # the inbound agent speaks with the same voice
+        await inbound.apply("voice saved")
     return {**res, "cartesia": await _sync_agent("voice saved")}
 
 

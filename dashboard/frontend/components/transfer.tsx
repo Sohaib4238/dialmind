@@ -2,13 +2,13 @@ import type { Call, TransferStatus } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 export const TRANSFER_LABEL: Record<Exclude<TransferStatus, "">, string> = {
-  unavailable: "Supervisor was unavailable",
-  waiting: "Waiting for the supervisor",
+  unavailable: "No supervisor was available",
+  waiting: "Waiting for a supervisor",
   accepted: "Supervisor accepted",
-  declined: "Supervisor was busy",
-  timeout: "Supervisor didn't answer",
+  declined: "Supervisors were busy",
+  timeout: "No supervisor answered",
   transferring: "Transferring",
-  transferred: "Transferred to the supervisor",
+  transferred: "Transferred",
   failed: "Transfer didn't go through",
 }
 
@@ -30,7 +30,10 @@ export function TransferInfo({ call, className }: { call: Call; className?: stri
   return (
     <div className={cn("space-y-1.5 rounded-md border border-border bg-surface-2 p-3 text-[13px]", className)}>
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <span className={cn("font-medium", TONE[st] ?? "text-foreground")}>{TRANSFER_LABEL[st] ?? st}</span>
+        <span className={cn("font-medium", TONE[st] ?? "text-foreground")}>
+          {TRANSFER_LABEL[st] ?? st}
+          {call.transfer_to_name && ["accepted", "transferring", "transferred", "failed"].includes(st) && ` · taken by ${call.transfer_to_name}`}
+        </span>
         {call.transfer_note && <span className="text-[12px] text-faint">{call.transfer_note}</span>}
       </div>
       {call.transfer_summary && (

@@ -222,6 +222,22 @@ async def list_numbers() -> list[dict]:
     return _items(await request("GET", "/agents/phone-numbers"))
 
 
+async def get_number(number_id: str) -> dict:
+    return await request("GET", f"/agents/phone-numbers/{number_id}")
+
+
+async def assign_number(number_id: str, agent_id: str | None) -> dict:
+    """Route inbound calls on this number to an agent (None: unassign, nobody answers). Outbound calls from the
+    number work either way."""
+    return await request("PATCH", f"/agents/phone-numbers/{number_id}", json={"agent_id": agent_id})
+
+
+async def update_provider_inbound(provider_id: str, inbound: dict) -> dict:
+    """Merge-patch a SIP trunk's inbound side (the outbound side is left as it is)."""
+    return await request("PATCH", f"/agents/phone-numbers/providers/{provider_id}",
+                         json={"type": "sip_trunk", "inbound": inbound})
+
+
 async def import_number(label: str, number: str, provider_id: str) -> dict:
     return await request("POST", "/agents/phone-numbers",
                          json={"label": label, "number": number, "provider": {"id": provider_id}})

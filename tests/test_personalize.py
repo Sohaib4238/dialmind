@@ -57,7 +57,7 @@ print("placeholders: {lead_name} ok in scripts and voicemail; {callback_time} on
 # 3. Variables: always every key, cleaned and length-capped.
 empty = lead_variables(None)
 assert set(empty) == {"lead_name", "business_name", "service_required", "business_description", "job_description",
-                      "location", "specialist_title"} and empty.pop("specialist_title") == "one of our senior specialists"
+                      "location", "specialist_title", "lead_source"} and empty.pop("specialist_title") == "one of our senior specialists"
 assert all(v == "" for v in empty.values())
 lead = Lead(phone="+13055550121", name="  Maria {{x}}\n Lopez ", business="Bloom", service_required="Website",
             business_description="y" * 900, job_description="", location="", city="Miami")
@@ -102,7 +102,7 @@ assert sent[0]["location"] == "Miami, FL 33130" and sent[0]["company_name"] == s
 assert sent[0]["specialist_title"] == "our senior web designer", sent[0]
 assert sent[1]["lead_name"] == "" and sent[1]["service_required"] == "", sent[1]
 assert sent[1]["specialist_title"] == "one of our senior specialists", sent[1]
-assert sent[0]["silent_greeting"].startswith("Hi, is this Maria Lopez? This is "), sent[0]  # call start: the AI greets a silent callee
-assert sent[1]["silent_greeting"].startswith("This is "), sent[1]  # no name, no "is this ?"
+assert sent[0]["silent_greeting"] == "Hello?", sent[0]  # call start: a silent callee only hears a short check
+assert sent[1]["silent_greeting"] == "Hello?", sent[1]  # never the introduction (History #38)
 print("calls: lead details sent per call; unknown number -> empty values")
 print("ALL PERSONALIZATION TESTS PASS")
