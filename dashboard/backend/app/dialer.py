@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 from sqlmodel import select
 
-from app import health, sheet_sync, test_mode
+from app import health, rejections, sheet_sync, test_mode
 from app.area_codes import zone
 from app.timezones import lead_timezone
 from app.bus import bus
@@ -112,12 +112,14 @@ class AutoDialer:
         self.manager = manager
         self.state = "off"  # off / on / paused
         self.reason = ""
+        self.alert = ""  # a red warning on the dialer panel (calls refused, Telnyx balance); cleared on turn-on
         self.session_calls = 0
         self.failures_in_row = 0
         self.current: dict | None = None
         self.wait_detail = ""
         self.log: deque[dict] = deque(maxlen=200)
         self._task: asyncio.Task | None = None
+        rejections.listeners.append(self.stop_for_rejections)
 
     # ---- state ---------------------------------------------------------------------
 
@@ -143,6 +145,7 @@ class AutoDialer:
         return {
             "state": self.state,
             "reason": self.reason,
+            "alert": self.alert,
             "test_mode": self.test_mode,
             "test_number": test_mode.number(),
             "session_calls": self.session_calls,
@@ -167,7 +170,7 @@ class AutoDialer:
     def turn_on(self) -> dict:
         if self.state == "on":
             return self.snapshot()
-        self.state, self.reason = "on", ""
+        self.state, self.reason, self.alert = "on", "", ""
         self.session_calls = 0
         self.failures_in_row = 0
         self._note(f"Dialer ON{' (TEST MODE: every call goes to ' + format_phone(test_mode.number()) + ')' if self.test_mode else ''}")
@@ -182,6 +185,20 @@ class AutoDialer:
             tail = " (the call in progress finishes normally)" if self.current else ""
             self._note(f"Dialer OFF: {reason}{tail}")
         return self.snapshot()
+
+    def stop_for_rejections(self, why: str) -> None:
+        """rejections.py: calls are being refused before they ring. Off (also shown when it was already off)."""
+        self.alert = why
+        self.failures_in_row = max(self.failures_in_row, rejections.STREAK)
+        if self.state != "off":
+            self.state, self.reason = "off", "Calls are being refused (see the red warning)"
+        self._note(f"Dialer OFF: {why}", "error")
+
+    def _stop_alert(self, why: str) -> None:
+        self.alert = why
+        self.turn_off(why)
+        self.log[-1]["level"] = "error"
+        self.publish()
 
     def _pause(self, reason: str) -> None:
         self.state, self.reason = "paused", reason
@@ -220,6 +237,12 @@ class AutoDialer:
             left = health.minutes_left()
             if left < d.min_free_minutes:
                 self.turn_off(f"Only ~{left} Cartesia minutes left this month (stops below {d.min_free_minutes})")
+                break
+            await health.refresh_telnyx()  # at most every 5 min
+            bal = health.telnyx_balance()
+            if bal is not None and bal < health.TELNYX_STOP_BELOW:
+                self._stop_alert(f"Telnyx balance is ${bal:.2f} (stops below ${health.TELNYX_STOP_BELOW:.2f}). At $0 Telnyx "
+                                 "switches the account off and every call is refused. Top up in the Telnyx portal.")
                 break
             lead, info = pick_next()
             if lead is None:
@@ -270,7 +293,7 @@ class AutoDialer:
         via = f" via test number {format_phone(dial)}" if self.test_mode else ""
         self._note(f"Calling {who} ({format_phone(lead.phone)}, attempt {attempt}, {info.get('local_time')}){via}")
         result, reason = await self._wait_for_end(call.id)
-        self.failures_in_row = self.failures_in_row + 1 if result == "failed" else 0
+        self.failures_in_row = self.failures_in_row + 1 if result in ("failed", rejections.RESULT) else 0
         self._note(f"{who}: {result or 'ended'}{f' ({reason})' if reason else ''}", "error" if result == "failed" else "info")
         self.current = None
         self._check_failures(d)

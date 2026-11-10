@@ -18,11 +18,12 @@ from zoneinfo import ZoneInfo
 
 from sqlmodel import select
 
-from app import cartesia, cartesia_setup, emails, inbound, leads, outcomes, sheet_sync, sms, storage, supervisor, test_mode
+from app import cartesia, emails, inbound, leads, outcomes, providers, rejections, sheet_sync, sms, storage, supervisor, test_mode
 from app.agent_config import (EMAIL_REASONS, EMAIL_TOOL_NAME, introduction, lead_variables, silent_greeting,
                               supervisor_enabled, time_variables)
 from app.bus import bus
 from app.db import Call, CallEvent, Lead, as_utc, call_to_dict, event_to_dict, get_session, utcnow
+from app.providers.base import CallNotConnected, ProviderError
 from app.timezones import lead_timezone
 from settings import SettingsError, load_settings  # shared/settings.py
 
@@ -105,6 +106,25 @@ class CallError(Exception):
     """Problem found before dialing (bad number, config, Cartesia refused)."""
 
 
+def call_variables(settings, lead_row, number: str) -> tuple[dict, dict]:
+    """The per-call variables every provider gets (lead details, local time, supervisor status, opening lines)."""
+    tz_name, _ = lead_timezone(lead_row.location if lead_row else "", lead_row.phone if lead_row else number)
+    sup_vars = supervisor.call_variables()
+    lead_vars = lead_variables(lead_row, settings)
+    variables = {"caller_name": settings.caller_name, "company_name": settings.company_name,
+                 **lead_vars, **time_variables(tz_name, utcnow()), **sup_vars,
+                 "silent_greeting": silent_greeting(settings, lead_vars),
+                 "intro_line": introduction(settings, lead_vars),
+                 "lead_email": lead_row.email if lead_row else ""}
+    return variables, sup_vars
+
+
+def _provider_of(call_id: int):
+    """The voice provider a call was made with (stored on the call; older rows: Cartesia)."""
+    with get_session() as s:
+        return providers.for_call(s.get(Call, call_id))
+
+
 def _publish_call(call: Call) -> None:
     bus.publish({"type": "call", "call": call_to_dict(call)})
 
@@ -154,6 +174,7 @@ def apply_status(call_id: int, status: str, detail: str = "", data: dict | None 
     _publish_call(call)
     if status in FINAL:
         leads.on_call_finished(call)
+        rejections.after_call(call)  # 3 "busy" in a row = the phone company refusing calls: relabel, dialer off
         emails.after_call(call_id)  # follow-up email (background), if the outcome calls for one
         sms.after_call(call_id)  # follow-up text (background / queued), if the outcome calls for one
         sheet_sync.wake()  # the lead's row in the results sheet, now
@@ -389,7 +410,7 @@ class CallManager:
         with get_session() as s:
             stale = s.exec(select(Call).where(Call.status.in_(ACTIVE))).all()
         for c in stale:
-            if c.source in ("dashboard", "inbound") and c.room.startswith("ac_"):
+            if c.source in ("dashboard", "inbound") and providers.is_live_ref(c.room):
                 # Re-check with Cartesia right away; the poller ends it if Cartesia says it's over.
                 _debug(c.id, "recheck_after_restart", "Backend restarted: re-checking this call with Cartesia")
                 self._spawn(self._poll(c.id, c.room))
@@ -420,18 +441,15 @@ class CallManager:
             settings = load_settings()
         except SettingsError as e:
             raise CallError(f"Fix config/agent_settings.yaml first. {e}") from None
-        agent_id, from_id = os.getenv("CARTESIA_AGENT_ID", ""), os.getenv("CARTESIA_FROM_NUMBER_ID", "")
-        if not agent_id or not from_id:
-            raise CallError("Cartesia isn't set up yet: run python dashboard\\backend\\setup_cartesia.py")
-
+        provider = providers.get()  # Cartesia (default) or Phonic, from the Instructions page
         try:
-            sync = await cartesia_setup.sync_agent("before a call")  # pushes agent_settings.yaml if it changed
-        except cartesia.CartesiaError as e:
-            raise CallError(f"Couldn't update the Cartesia agent: {e}") from None
+            sync = await provider.prepare()  # Cartesia: pushes agent_settings.yaml if it changed
+        except ProviderError as e:
+            raise CallError(str(e)) from None
 
         with get_session() as s:
             call = Call(room=f"pending-{uuid.uuid4().hex[:10]}", number=dial, status="dialing", source="dashboard",
-                        lead_id=lead_id)
+                        lead_id=lead_id, provider=provider.name)
             s.add(call)
             s.commit()
             s.refresh(call)
@@ -444,14 +462,7 @@ class CallManager:
 
         max_minutes = max(1, min(settings.settings.max_call_minutes, MAX_CALL_MINUTES_CAP))
         lead_row = leads.get_lead_row(lead_id) if lead_id else None
-        tz_name, _ = lead_timezone(lead_row.location if lead_row else "", lead_row.phone if lead_row else number)
-        sup_vars = supervisor.call_variables()
-        lead_vars = lead_variables(lead_row, settings)
-        variables = {"caller_name": settings.caller_name, "company_name": settings.company_name,
-                     **lead_vars, **time_variables(tz_name, utcnow()), **sup_vars,
-                     "silent_greeting": silent_greeting(settings, lead_vars),
-                     "intro_line": introduction(settings, lead_vars),
-                     "lead_email": lead_row.email if lead_row else ""}
+        variables, sup_vars = call_variables(settings, lead_row, number)
         if supervisor_enabled() and sup_vars["supervisor_status"] != "available":  # interested -> callback instead
             with get_session() as s:
                 row = s.get(Call, call.id)
@@ -460,9 +471,14 @@ class CallManager:
                 s.add(row)
                 s.commit()
         try:
-            agent_call_id = await cartesia.create_call(agent_id, from_id, dial, variables, RINGING_TIMEOUT_S, max_minutes)
-        except cartesia.CartesiaError as e:
-            _debug(call.id, "call_request_failed", str(e))
+            agent_call_id = await provider.start_call(dial, variables, RINGING_TIMEOUT_S, max_minutes)
+        except CallNotConnected as e:  # Phonic: the carrier refused / nobody answered before the request returned
+            _debug(call.id, "call_not_connected", str(e), result=e.result, provider=provider.name)
+            apply_status(call.id, "ended" if e.result in ("busy", "no_answer") else "failed", str(e), result=e.result)
+            with get_session() as s:
+                return s.get(Call, call.id)
+        except ProviderError as e:
+            _debug(call.id, "call_request_failed", str(e), provider=provider.name)
             apply_status(call.id, "failed", str(e), result="failed")
             raise CallError(str(e)) from None
 
@@ -473,8 +489,9 @@ class CallManager:
             s.commit()
             s.refresh(row)
         _publish_call(row)
-        _debug(call.id, "call_requested", f"Cartesia call {agent_call_id} to {dial}", agent_call_id=agent_call_id,
-               ringing_timeout_s=RINGING_TIMEOUT_S, max_call_minutes=max_minutes, variables=variables)
+        _debug(call.id, "call_requested", f"{provider.label} call {agent_call_id} to {dial}", agent_call_id=agent_call_id,
+               provider=provider.name, ringing_timeout_s=RINGING_TIMEOUT_S, max_call_minutes=max_minutes,
+               variables=variables)
         self._spawn(self._poll(call.id, agent_call_id))
         return row
 
@@ -491,19 +508,20 @@ class CallManager:
         if call.simulated:
             apply_status(call_id, "ended", "Hung up from dashboard")
             return {"ok": True, "ended": True}
-        if not call.room.startswith("ac_"):
+        if not providers.is_live_ref(call.room):
             apply_status(call_id, "failed", "Hung up before Cartesia accepted the call", result="failed")
             return {"ok": True, "ended": True}
 
         tr = self._tracker(call_id)
         tr.manual_hangup = True
+        provider = providers.for_call(call)
         loop = asyncio.get_running_loop()
         _debug(call_id, "hangup_requested", "Hang up requested from dashboard")
         logger.info("hang up %s (%s)", call_id, call.room)
         try:
-            resp = await cartesia.cancel_call(call.room)
+            resp = await provider.end_call(call.room)
             _debug(call_id, "cancel_response", "Cartesia accepted the hang-up", response=resp)
-        except cartesia.CartesiaError as e:
+        except ProviderError as e:
             _debug(call_id, "cancel_response", f"Cartesia refused the hang-up: {e}", status=e.status, body=e.body)
             if e.status != 409:  # 409 = Cartesia says the call isn't active any more: confirm below
                 raise HangupFailed(f"Cartesia refused the hang-up: {e}") from None
@@ -513,8 +531,8 @@ class CallManager:
         deadline = loop.time() + HANGUP_CONFIRM_S
         while loop.time() < deadline and not tr.final:
             try:
-                self.ingest_call(call_id, await cartesia.get_call(call.room), source="hangup-check")
-            except cartesia.CartesiaError:
+                self.ingest_call(call_id, await provider.get_call(call.room), source="hangup-check")
+            except ProviderError:
                 pass
             if not tr.final:
                 await asyncio.sleep(1.0)
@@ -531,16 +549,17 @@ class CallManager:
 
     async def _poll(self, call_id: int, agent_call_id: str) -> None:
         tr = self._tracker(call_id)
+        provider = _provider_of(call_id)
         loop = asyncio.get_running_loop()
         started = loop.time()
         while not tr.final:
             try:
-                data = await cartesia.get_call(agent_call_id)
+                data = await provider.get_call(agent_call_id)
                 if tr.poll_errors:
                     _debug(call_id, "poll_recovered", f"Cartesia reachable again after {tr.poll_errors} failed checks")
                     tr.poll_errors = 0
                 self.ingest_call(call_id, data, source="poll")
-            except cartesia.CartesiaError as e:
+            except ProviderError as e:
                 tr.poll_errors += 1
                 if tr.poll_errors == 1:
                     _debug(call_id, "poll_error", "Couldn't read the call from Cartesia", error=str(e))
@@ -557,9 +576,9 @@ class CallManager:
         tr.auto_cancel_at = asyncio.get_running_loop().time()
         tr.auto_close_label = label
         try:
-            resp = await cartesia.cancel_call(agent_call_id)
+            resp = await _provider_of(call_id).end_call(agent_call_id)
             _debug(call_id, step, label, response=resp)
-        except cartesia.CartesiaError as e:
+        except ProviderError as e:
             if e.status != 409:  # 409 = already over
                 _debug(call_id, step, f"{label}, but Cartesia refused: {e}", status=e.status)
         _add_event(call_id, "log", "agent", label, {"level": "info"})
@@ -640,7 +659,7 @@ class CallManager:
     def callee_hung_up(self, number: str, detail: str) -> dict:
         """The carrier (Telnyx webhook) says the callee hung up: close the Cartesia call now."""
         active = self.active_call()
-        if active is None or active.number != number or not active.room.startswith("ac_"):
+        if active is None or active.number != number or not providers.is_live_ref(active.room):
             return {"ok": True, "ignored": "no live call to that number"}
         tr = self._tracker(active.id)
         if tr.final or tr.auto_cancel_at is not None or tr.manual_hangup:
@@ -1291,7 +1310,7 @@ class CallManager:
         """The call's recording (WAV from Cartesia), cached in data/recordings/."""
         with get_session() as s:
             call = s.get(Call, call_id)
-        if call is None or not call.room.startswith("ac_") or call.status not in FINAL:
+        if call is None or not providers.is_live_ref(call.room) or call.status not in FINAL:
             return None
         if storage.expired(call.created_at):  # past the keep period: don't fetch it back from Cartesia
             return None
@@ -1299,7 +1318,7 @@ class CallManager:
         cached = RECORDINGS_DIR / f"{call.room}.wav"
         if cached.exists():
             return cached.read_bytes(), "audio/wav"
-        audio, mime = await cartesia.call_audio(call.room)
+        audio, mime = await providers.for_call(call).recording(call.room)
         if audio:
             cached.write_bytes(audio)
         return audio, mime or "audio/wav"

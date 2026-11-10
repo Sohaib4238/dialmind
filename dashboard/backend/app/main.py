@@ -30,7 +30,7 @@ from env_utils import file_log  # noqa: E402
 
 # Every call step, webhook and Cartesia error ends up in logs/backend.log.
 file_log("backend.log")
-from app import agent_config, ambience, auth, cartesia, cartesia_setup, emails, gsheets, health, inbound, leads, results_sheet, settings_store, sheet_sync, sms, standby, storage, supervisor, telnyx_events, test_mode, tunnel, unsubscribe, voices  # noqa: E402
+from app import agent_config, ambience, auth, cartesia, cartesia_setup, emails, gsheets, health, inbound, leads, phonic, providers, rejections, results_sheet, settings_store, sheet_sync, sms, standby, storage, supervisor, telnyx_events, test_mode, tunnel, unsubscribe, voices  # noqa: E402
 from settings import SettingsError  # noqa: E402
 from app.dialer import AutoDialer  # noqa: E402
 from app.bus import bus  # noqa: E402
@@ -56,6 +56,10 @@ async def lifespan(app: FastAPI):
         logger.warning(standby.DETAIL)
     leads.apply_service_fit()  # leads imported before the service-fit check existed
     manager.mark_stale_calls()
+    if n := leads.fix_placeholder_names():  # leads named "na" / "N/A" before names were cleaned
+        logger.info("cleared %s placeholder lead names", n)
+    if n := rejections.repair_history():  # runs of refused calls before the check existed: attempts given back
+        logger.warning("%s refused calls relabelled as trunk_rejected; their leads got the attempt back", n)
     watcher = asyncio.create_task(tunnel.watch())
     inbox = asyncio.create_task(unsubscribe.watch())  # STOP replies -> Do not contact (off unless IMAP is set up)
     texts = asyncio.create_task(sms.watch())  # queued follow-up texts, sent when the lead's calling hours start
@@ -588,7 +592,11 @@ async def _tool_payload(request: Request) -> dict:
         payload = json.loads(raw or b"{}")
     except ValueError:
         raise HTTPException(400, "Body must be JSON")
-    return payload if isinstance(payload, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    info = payload.get("call_info")
+    if not payload.get("call_id") and isinstance(info, dict):  # Phonic: the conversation id is in call_info
+        payload["call_id"] = str(info.get("conversation_id") or "")
+    return payload
 
 
 # ---- supervisor (Phase 6) -------------------------------------------------------------
@@ -822,6 +830,47 @@ async def save_settings(body: SaveSettings) -> dict:
         raise HTTPException(409, str(e))
     leads.apply_service_fit()  # the service-fit keywords may have changed
     return {**res, "cartesia": await _sync_agent("instructions saved"), "inbound": await inbound.apply("instructions saved")}
+
+
+# ---- voice provider (Cartesia / Phonic) -------------------------------------------------
+
+def _provider_payload() -> dict:
+    return {**providers.load(), "features": providers.features(), "noises": list(providers.PHONIC_NOISES),
+            "speed_range": list(providers.SPEED_RANGE), "phonic_configured": phonic.configured(),
+            "phonic_test_only": phonic.test_only(), "phonic_test_number": phonic.test_only_number()}
+
+
+@app.get("/api/voice-provider")
+async def get_voice_provider() -> dict:
+    return _provider_payload()
+
+
+class SaveVoiceProvider(BaseModel):
+    provider: str
+    phonic: dict | None = None
+
+
+@app.put("/api/voice-provider")
+async def save_voice_provider(body: SaveVoiceProvider) -> dict:
+    if manager.active_call():
+        raise HTTPException(409, "A call is in progress. Change the voice provider after it ends.")
+    if body.provider == "phonic" and not phonic.configured():
+        raise HTTPException(422, "PHONIC_API_KEY is not set in .env")
+    try:
+        await asyncio.to_thread(providers.save, body.provider, body.phonic)
+    except providers.ProviderSettingsError as e:
+        raise HTTPException(422, str(e))
+    return _provider_payload()
+
+
+@app.get("/api/phonic/voices")
+async def phonic_voices() -> dict:
+    try:
+        voices_ = await phonic.list_voices()
+    except phonic.PhonicError as e:
+        raise HTTPException(502, str(e))
+    return {"voices": [{"id": v.get("id"), "name": v.get("name") or v.get("id"), "description": v.get("description") or "",
+                        "preview_url": v.get("audio_url") or ""} for v in voices_ if v.get("id")]}
 
 
 # ---- voice (Cartesia) ---------------------------------------------------------------

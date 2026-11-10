@@ -62,6 +62,7 @@ class Call(SQLModel, table=True):
     transfer_to: str = ""
     transfer_to_name: str = ""
     transfer_to_phone: str = ""
+    provider: str = "cartesia"  # the voice provider that ran the call: cartesia / phonic (app/providers)
 
 
 class CallEvent(SQLModel, table=True):
@@ -208,6 +209,7 @@ NEW_COLUMNS = [
     ("call", "transfer_to_name", "VARCHAR NOT NULL DEFAULT ''"),
     ("call", "transfer_to_phone", "VARCHAR NOT NULL DEFAULT ''"),
     ("lead", "lead_source", "VARCHAR NOT NULL DEFAULT ''"),
+    ("call", "provider", "VARCHAR NOT NULL DEFAULT 'cartesia'"),
     ("lead", "budget", "VARCHAR NOT NULL DEFAULT ''"),
     ("lead", "additional_info", "VARCHAR NOT NULL DEFAULT ''"),
     ("lead", "alt_phones", "VARCHAR NOT NULL DEFAULT ''"),
@@ -292,6 +294,7 @@ def call_to_dict(c: Call) -> dict:
         "transfer_declined_by": c.transfer_declined_by or [],
         "transfer_to": c.transfer_to or "",
         "transfer_to_name": c.transfer_to_name or "",
+        "provider": c.provider or "cartesia",
     }
 
 

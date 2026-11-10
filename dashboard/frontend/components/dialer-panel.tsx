@@ -110,6 +110,13 @@ export function DialerPanel() {
           </div>
         )}
 
+        {d.alert && (
+          <div role="alert" className="flex items-start gap-2 border-b border-danger/30 bg-danger-soft px-4 py-2.5 text-[13px] leading-5 text-danger">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" strokeWidth={1.75} />
+            <span><span className="font-semibold">Dialer stopped. </span>{d.alert}</span>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 gap-5 p-4 lg:grid-cols-[1fr_minmax(280px,380px)]">
           <div className="min-w-0 space-y-4">
             <div className="flex items-center gap-4">

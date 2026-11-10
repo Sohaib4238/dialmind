@@ -1,4 +1,4 @@
-import type { AppConfig, AuthMe, BackgroundSound, Call, CallEvent, DialerOrder, DialerState, Email, EmailState, Health, ImportPreview, Lead, LeadCounts, LeadDetail, LeadsList, SaveResult, SettingsPayload, SheetSettings, SheetsStatus, SheetSyncSummary, Sms, SmsState, SupervisorHours, SupervisorRequest, SupervisorSettings, VoiceList, VoicePayload, VoiceSettings } from "./types"
+import type { PhonicOptions, PhonicVoice, VoiceProviderName, VoiceProviderState, AppConfig, AuthMe, BackgroundSound, Call, CallEvent, DialerOrder, DialerState, Email, EmailState, Health, ImportPreview, Lead, LeadCounts, LeadDetail, LeadsList, SaveResult, SettingsPayload, SheetSettings, SheetsStatus, SheetSyncSummary, Sms, SmsState, SupervisorHours, SupervisorRequest, SupervisorSettings, VoiceList, VoicePayload, VoiceSettings } from "./types"
 
 /** True when the dashboard is opened from another computer (through the dashboard tunnel). */
 export const IS_REMOTE =
@@ -86,6 +86,10 @@ export const api = {
   health: () => request<Health>("/api/health"),
   runChecks: () => request<Health>("/api/health/check", { method: "POST" }),
   settings: () => request<SettingsPayload>("/api/settings"),
+  voiceProvider: () => request<VoiceProviderState>("/api/voice-provider"),
+  saveVoiceProvider: (provider: VoiceProviderName, phonic?: Partial<PhonicOptions>) =>
+    request<VoiceProviderState>("/api/voice-provider", { method: "PUT", body: JSON.stringify({ provider, phonic }) }),
+  phonicVoices: () => request<{ voices: PhonicVoice[] }>("/api/phonic/voices"),
   saveSettings: (values: Record<string, unknown>, version: string) =>
     request<SaveResult>("/api/settings", {
       method: "PUT",

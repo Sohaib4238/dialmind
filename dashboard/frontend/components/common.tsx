@@ -61,7 +61,7 @@ export function Tag({ children, tone = "neutral" }: { children: React.ReactNode;
 export function ResultTag({ result, active }: { result: CallResult; active?: boolean }) {
   if (active) return <Tag tone="signal">In progress</Tag>
   if (!result) return <Tag>–</Tag>
-  return <Tag tone={result === "answered" ? "neutral" : result === "failed" ? "danger" : result === "voicemail" ? "signal" : "neutral"}>{RESULT_LABEL[result]}</Tag>
+  return <Tag tone={result === "answered" ? "neutral" : result === "failed" || result === "trunk_rejected" ? "danger" : result === "voicemail" ? "signal" : "neutral"}>{RESULT_LABEL[result]}</Tag>
 }
 
 export function EmptyState({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {

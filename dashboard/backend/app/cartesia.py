@@ -10,6 +10,7 @@ import os
 import aiohttp
 
 from app import standby, test_mode
+from app.providers.base import ProviderError
 
 BASE_URL = "https://api.cartesia.ai"
 API_VERSION = "2026-08-14"
@@ -17,11 +18,8 @@ TIMEOUT = aiohttp.ClientTimeout(total=20)
 UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=120)
 
 
-class CartesiaError(Exception):
-    def __init__(self, message: str, status: int = 0, body: object = None) -> None:
-        super().__init__(message)
-        self.status = status
-        self.body = body
+class CartesiaError(ProviderError):
+    pass
 
 
 def api_key() -> str:

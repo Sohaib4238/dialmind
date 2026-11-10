@@ -176,7 +176,13 @@ If the name doesn't match who answers, just ask who you're speaking with.
 """
 
 
-def build_instructions(s: AgentSettings) -> str:
+def build_instructions(s: AgentSettings, *, outcome: bool | None = None, supervisor: bool | None = None,
+                       email: bool | None = None, end_tool: str = "end_call", voicemail_tool: bool = True) -> str:
+    """The agent's instructions, for every voice provider. None = the Cartesia tools in .env decide (the default);
+    another provider passes which of our tools it has, the name of its hang-up tool and whether it has a voicemail tool."""
+    outcome = bool(os.getenv("CARTESIA_OUTCOME_TOOL_ID", "").strip()) if outcome is None else outcome
+    supervisor = supervisor_enabled() if supervisor is None else supervisor
+    email = email_enabled(s) if email is None else email
     objections = "\n".join(f"- {o.objection}: {s.fill(o.response)}" for o in s.objection_handling)
     return f"""\
 # Who you are
@@ -206,10 +212,10 @@ to a small US business. You speak English.
 Example goodbye: "{s.fill(s.goodbye.line)}"
 Ending is your job: as soon as a goodbye has been said (by you or by them), or they clearly want to go, say one short goodbye line and use the end call tool in the same turn. Never wait for them to hang up. If they go silent after your goodbye, use the end call tool. Keep calls short.
 
-{silence_rules(s)}{outcome_rules() if os.getenv("CARTESIA_OUTCOME_TOOL_ID", "").strip() else ""}\
-{supervisor_rules(s) if supervisor_enabled() else ""}\
-{email_rules() if email_enabled(s) else ""}
-{voicemail_rules(s)}
+{silence_rules(s)}{outcome_rules() if outcome else ""}\
+{supervisor_rules(s) if supervisor else ""}\
+{email_rules() if email else ""}
+{voicemail_rules(s, end_tool, voicemail_tool)}
 
 # Output rules
 Your words are turned into speech: plain spoken words only. No lists, bullet points, markdown, \
@@ -242,7 +248,12 @@ then move on without it.
 """
 
 
-def voicemail_rules(s: AgentSettings) -> str:
+def voicemail_rules(s: AgentSettings, end_tool: str = "end_call", voicemail_tool: bool = True) -> str:
+    if not s.voicemail.leave_message and not voicemail_tool:  # no voicemail tool (Phonic): hang up with the end tool
+        return f"""# Voicemail
+If you reach a voicemail greeting or an answering machine, say nothing to the recording and use {end_tool} right \
+away. Don't start a conversation with a recording, and don't use {OUTCOME_TOOL_NAME} for it.
+"""
     if not s.voicemail.leave_message:
         return f"""# Voicemail
 If you reach a voicemail greeting or an answering machine, use the voicemail tool right away. \
@@ -253,11 +264,11 @@ Don't start a conversation with a recording, and don't use {OUTCOME_TOOL_NAME} f
     return f"""# Voicemail
 If you reach a voicemail greeting or an answering machine, don't start a conversation with the recording, and \
 don't use {OUTCOME_TOOL_NAME} for it. Let the greeting finish (it ends with a beep or the tone). Then leave this \
-message: say it once, in full, calmly and clearly, and use end_call in the same turn, right after the message. \
-Never use end_call before you have said the whole message:
+message: say it once, in full, calmly and clearly, and use {end_tool} in the same turn, right after the message. \
+Never use {end_tool} before you have said the whole message:
 "{message}"
 If a detail in it is empty, leave that part out so it still sounds natural. Say phone numbers digit by digit. \
-Say nothing else to the recording. If the mailbox is full or can't take messages, say "Goodbye." and use end_call.
+Say nothing else to the recording. If the mailbox is full or can't take messages, say "Goodbye." and use {end_tool}.
 """
 
 

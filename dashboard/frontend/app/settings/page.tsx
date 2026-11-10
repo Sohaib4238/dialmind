@@ -176,6 +176,12 @@ export default function SettingsPage() {
       ) : (
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-[180px_1fr]">
           <nav className="sticky top-8 hidden h-fit flex-col gap-0.5 lg:flex">
+            <a
+              href="#section-voice-provider"
+              className="flex h-7 items-center rounded-md px-2 text-[12px] text-muted-foreground transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground"
+            >
+              Voice provider
+            </a>
             {data.fields.map((f) => (
               <a
                 key={f.path}

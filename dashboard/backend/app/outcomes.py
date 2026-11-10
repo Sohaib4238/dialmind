@@ -48,7 +48,7 @@ AI_CALLBACK_OUTCOMES = ("not_now", "gatekeeper", "interested")
 TRANSFER_OUTCOMES = ("transferred", "transfer_declined", "transfer_failed")
 UNREACHED = ("no_answer", "voicemail", "bad_line", "failed")  # nobody to talk to
 RESULT_OUTCOME = {"answered": "needs_review", "voicemail": "voicemail", "no_answer": "no_answer", "busy": "no_answer",
-                  "bad_line": "bad_line", "failed": "failed"}
+                  "bad_line": "bad_line", "failed": "failed", "trunk_rejected": "failed"}
 
 CALLBACK_MIN_AHEAD = timedelta(minutes=10)
 CALLBACK_MAX_AHEAD = timedelta(days=90)

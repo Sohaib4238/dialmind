@@ -10,14 +10,14 @@ import io
 import os
 import re
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlmodel import func, or_, select
 
 from app import outcomes
 from app.bus import bus
 from app.timezones import lead_timezone
-from app.db import LEAD_STATUSES, Call, Lead, LeadEvent, get_session, lead_event_to_dict, lead_to_dict, utcnow
+from app.db import LEAD_STATUSES, Call, Lead, LeadEvent, as_utc, get_session, lead_event_to_dict, lead_to_dict, utcnow
 from settings import SettingsError, keywords, load_settings  # shared/settings.py
 
 MAX_CSV_BYTES = 5_000_000
@@ -169,7 +169,7 @@ def parse_csv(text: str, filename: str = "") -> dict:
 
         raw_phone = col("phone")
         phone, why = normalize_us_phone(raw_phone)
-        name = col("name") or " ".join(x for x in (col("first_name"), col("last_name")) if x)
+        name = clean_name(col("name")) or clean_name(" ".join(x for x in (clean_name(col("first_name")), clean_name(col("last_name"))) if x))
         fields = {
             "name": name,
             "business": col("business"),
@@ -227,6 +227,31 @@ def parse_csv(text: str, filename: str = "") -> dict:
 def _clean(v: str) -> str:
     """CSV cell -> single-spaced text (keeps it safe to show and to pass to the agent)."""
     return re.sub(r"\s+", " ", (v or "").replace("\x00", "")).strip()
+
+
+# "na" / "N/A" in a name column means "no name" (the sales sheet has rows named "na"): the AI must never say it.
+PLACEHOLDER_NAMES = {"na", "n/a", "n.a", "n.a.", "n / a", "none", "null", "nil", "-", "--", "unknown"}
+
+
+def clean_name(v: str) -> str:
+    v = _clean(v)
+    return "" if v.lower() in PLACEHOLDER_NAMES else v
+
+
+def fix_placeholder_names() -> int:
+    """Leads saved with a name like "na" before clean_name existed: the name becomes empty. Safe to run every start."""
+    fixed = 0
+    with get_session() as s:
+        for lead in s.exec(select(Lead).where(Lead.name != "")).all():
+            if lead.name.strip().lower() in PLACEHOLDER_NAMES:
+                _log(s, lead.id, "note", f"Name {lead.name!r} means no name: cleared")
+                lead.name = ""
+                lead.updated_at = utcnow()
+                lead.results_dirty = lead.attempts > 0
+                s.add(lead)
+                fixed += 1
+        s.commit()
+    return fixed
 
 
 def _join_location(city: str, state: str, zip_: str) -> str:
@@ -560,6 +585,7 @@ def create_inbound_lead(phone: str, fields: dict, call_id: int) -> Lead:
     """A new caller (save_caller tool): a new lead from what they said on the call."""
     now = utcnow()
     with get_session() as s:
+        fields = {**fields, "name": clean_name(fields.get("name", ""))}
         lead = Lead(phone=phone, source=INBOUND_SOURCE, status="new", created_at=now, updated_at=now,
                     notes=fields.get("note", ""), **{col: fields.get(k, "") for k, col in CALLER_FIELDS.items()})
         s.add(lead)
@@ -578,6 +604,7 @@ def fill_from_caller(lead_id: int, fields: dict, call_id: int) -> int:
         if lead is None:
             return lead_id
         ours = lead.source == INBOUND_SOURCE
+        fields = {**fields, "name": clean_name(fields.get("name", ""))}
         changed = []
         for k, col in CALLER_FIELDS.items():
             v = fields.get(k, "")
@@ -618,6 +645,8 @@ def on_call_finished(call: Call) -> None:
         outcome = call.outcome or outcomes.from_result(call.result)
         new = outcomes.lead_status(outcome)
         old = lead.status
+        before = {"prev_callback_at": lead.callback_at.isoformat() if lead.callback_at else None,
+                  "prev_callback_note": lead.callback_note, "prev_callback_count": lead.callback_count}  # undo_attempt
         note = ""
         if outcome == "voicemail":
             lead.vm_count += 1
@@ -652,7 +681,45 @@ def on_call_finished(call: Call) -> None:
             what += ", message left" if call.vm_message_left else ", no message"
         _log(s, lead.id, "status", f"Call #{call.id}: {what}", call_id=call.id, result=call.result, outcome=outcome,
              source=call.outcome_source, old_status=old, new_status=lead.status,
-             callback_at=lead.callback_at.isoformat() if lead.callback_at else None)
+             callback_at=lead.callback_at.isoformat() if lead.callback_at else None, **before)
+        s.commit()
+        s.refresh(lead)
+    _publish(lead)
+
+
+def undo_attempt(call_id: int, why: str) -> None:
+    """A call that never reached the lead (e.g. refused by the phone company before ringing): it no longer counts.
+    One attempt less; the lead's latest call, status and callback go back to what they were before it."""
+    with get_session() as s:
+        call = s.get(Call, call_id)
+        lead = s.get(Lead, call.lead_id) if call and call.lead_id else None
+        if lead is None:
+            return
+        old = lead.status
+        lead.attempts = max(0, lead.attempts - 1)
+        if lead.last_call_id == call.id:
+            prev = s.exec(select(Call).where(Call.lead_id == lead.id, Call.id < call.id, Call.result != "trunk_rejected",
+                                             Call.direction == "outbound").order_by(Call.id.desc())).first()
+            lead.last_call_id = prev.id if prev else None
+            lead.last_call_at = prev.created_at if prev else None
+            ev = next((e for e in s.exec(select(LeadEvent).where(LeadEvent.lead_id == lead.id, LeadEvent.kind == "status")
+                                         .order_by(LeadEvent.id.desc())).all() if (e.data or {}).get("call_id") == call.id and not (e.data or {}).get("undone")), None)
+            d = (ev.data or {}) if ev else {}
+            if "prev_callback_count" in d:  # saved by on_call_finished
+                lead.callback_at = datetime.fromisoformat(d["prev_callback_at"]) if d["prev_callback_at"] else None
+                lead.callback_note, lead.callback_count = d.get("prev_callback_note") or "", d["prev_callback_count"]
+            elif ev and "callback missed" in ev.text and prev is not None:  # older log rows: the callback it replaced
+                lead.callback_count = max(0, lead.callback_count - 1)
+                lead.callback_at, lead.callback_note = prev.callback_at, prev.outcome_note if prev.callback_at else ""
+            if lead.callback_at is not None:
+                lead.callback_at = as_utc(lead.callback_at)
+            if not lead.dnc:
+                lead.status = _status_from_calls(s, lead)
+        lead.updated_at = utcnow()
+        lead.results_dirty = True
+        s.add(lead)
+        _log(s, lead.id, "status", f"Call #{call.id} didn't reach the lead ({why}): not counted as an attempt",
+             call_id=call.id, undone=True, old_status=old, new_status=lead.status)
         s.commit()
         s.refresh(lead)
     _publish(lead)

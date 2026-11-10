@@ -49,6 +49,7 @@ TEMPLATE_LABELS = {"not_answered": "Not answered / voicemail", "not_interested":
                    "not_now": "Not now / callback", "interested": "Interested"}
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 QUEUE_EVERY_S = 30
+BUSY_TEXT_DELAY_S = 300  # a "busy" can be the phone company refusing calls (rejections.py): wait, then send
 HTTP_TIMEOUT_S = 20
 OPT_OUT = "Reply STOP to opt out."
 # A whole reply that means "stop texting me" (carriers' standard opt-out words, and plain variants).
@@ -266,7 +267,7 @@ def _try_send(rec: SmsMessage, lead: Lead, s) -> None:
         logger.warning("text to lead %s: %s", lead.id, rec.detail)
 
 
-def create(lead_id: int, template: str, call_id: int | None = None, callback_at=None) -> dict:
+def create(lead_id: int, template: str, call_id: int | None = None, callback_at=None, delay_s: int = 0) -> dict:
     """Decide and send (or queue) one text to a lead, or save why not. Returns the stored record."""
     if template not in TEMPLATES:
         raise SmsError(f"Unknown template {template!r}")
@@ -296,13 +297,17 @@ def create(lead_id: int, template: str, call_id: int | None = None, callback_at=
             rec.detail = "not sent: the lead's time zone is unknown, so their calling hours are too (add a zip or state)"
         else:
             now = utcnow()
-            at = next_send_time(tz_name, s.settings.calling_hours, now)
+            at = next_send_time(tz_name, s.settings.calling_hours, now + timedelta(seconds=delay_s))
             if at is None:
                 rec.detail = "not sent: no calling days set (Instructions → Call settings)"
             elif at > now:
                 rec.status, rec.send_after = "queued", at
                 local = at.astimezone(zone(tz_name))
-                rec.detail = f"outside the lead's calling hours: sends {local:%a %b} {local.day}, {local:%H:%M} their time"
+                when = f"sends {local:%a %b} {local.day}, {local:%H:%M} their time"
+                if delay_s and at <= now + timedelta(seconds=delay_s + 1):
+                    rec.detail = f"waiting {delay_s // 60} min after a busy line (cancelled if the call was refused): {when}"
+                else:
+                    rec.detail = f"outside the lead's calling hours: {when}"
             else:
                 _try_send(rec, lead, s)
         with get_session() as db:
@@ -385,7 +390,8 @@ def for_call(call_id: int) -> dict | None:
     template = choose_template(call)
     if template is None:
         return None
-    return create(lead.id, template, call_id=call_id, callback_at=call.callback_at or lead.callback_at)
+    return create(lead.id, template, call_id=call_id, callback_at=call.callback_at or lead.callback_at,
+                  delay_s=BUSY_TEXT_DELAY_S if call.result == "busy" else 0)
 
 
 def _publish(rec: dict | None) -> None:

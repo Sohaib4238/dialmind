@@ -1,5 +1,5 @@
 export type CallStatus = "dialing" | "ringing" | "answered" | "ended" | "failed"
-export type CallResult = "answered" | "voicemail" | "no_answer" | "busy" | "bad_line" | "failed" | null
+export type CallResult = "answered" | "voicemail" | "no_answer" | "busy" | "bad_line" | "failed" | "trunk_rejected" | null
 
 export interface Call {
   id: number
@@ -33,6 +33,7 @@ export interface Call {
   transfer_declined_by?: string[]
   transfer_to?: string
   transfer_to_name?: string
+  provider?: VoiceProviderName
 }
 
 export type TransferStatus =
@@ -369,6 +370,8 @@ export interface DialerLogEntry {
 export interface DialerState {
   state: "off" | "on" | "paused"
   reason: string
+  /** Red warning: calls refused before they rang, or the Telnyx balance too low. Cleared when the dialer is turned on. */
+  alert?: string
   test_mode: boolean
   test_number: string
   session_calls: number
@@ -531,4 +534,41 @@ export interface SupervisorRequest {
     lead_timezone: string
   }
   transcript: { role: Role; text: string }[]
+}
+
+export type VoiceProviderName = "cartesia" | "phonic"
+
+export interface PhonicOptions {
+  voice_id: string
+  audio_speed: number
+  background_noise: "" | "office" | "call-center" | "coffee-shop"
+  background_noise_level: number
+}
+
+export interface ProviderFeatures {
+  label: string
+  voicemail_detection: boolean
+  voice_speed: boolean
+  background_sound: boolean
+  transfer: string
+  summary: boolean
+  webhooks: boolean
+}
+
+export interface VoiceProviderState {
+  provider: VoiceProviderName
+  phonic: PhonicOptions
+  features: Record<VoiceProviderName, ProviderFeatures>
+  noises: string[]
+  speed_range: [number, number]
+  phonic_configured: boolean
+  phonic_test_only: boolean
+  phonic_test_number: string
+}
+
+export interface PhonicVoice {
+  id: string
+  name: string
+  description: string
+  preview_url: string
 }

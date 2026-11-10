@@ -61,6 +61,7 @@ export const RESULT_LABEL: Record<Exclude<CallResult, null>, string> = {
   busy: "Busy",
   bad_line: "Bad line",
   failed: "Failed",
+  trunk_rejected: "Refused (not rung)",
 }
 
 export const isActive = (s: CallStatus) => s === "dialing" || s === "ringing" || s === "answered"

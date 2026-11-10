@@ -159,22 +159,72 @@ async def check_minutes() -> dict:
                    warn=b["left_dollars"] < b["plan_dollars"] * 0.3 or b["source"] != "cartesia")
 
 
-async def check_telnyx(http: aiohttp.ClientSession) -> dict:
-    t = time.perf_counter()
-    if not (os.getenv("TELNYX_SIP_USERNAME") and os.getenv("TELNYX_SIP_PASSWORD")):
-        return _result("Telnyx", False, "TELNYX_SIP_USERNAME / TELNYX_SIP_PASSWORD missing in .env", t)
+# Telnyx prepaid balance. At $0 Telnyx switches the account off: every call is refused before it rings (Cartesia
+# reports "busy", see rejections.py) and every text fails with "Account inactive" (2026-11-06, History #209-#220).
+TELNYX_WARN_BELOW = float(os.getenv("TELNYX_BALANCE_WARN", "5"))
+TELNYX_STOP_BELOW = float(os.getenv("TELNYX_BALANCE_STOP", "1"))  # the auto-dialer stops below this
+TELNYX_REFRESH_S = 300
+_telnyx: dict = {"at": 0.0, "balance": None, "currency": "USD", "error": None}
+
+
+async def refresh_telnyx(http: aiohttp.ClientSession | None = None, force: bool = False) -> dict:
+    """The Telnyx balance (GET /v2/balance, read only), at most every 5 min unless forced. Never raises."""
     key = (os.getenv("TELNYX_API_KEY") or "").strip()
     if not key:
-        return _result("Telnyx", True, "SIP credentials set. TELNYX_API_KEY not set yet (needed for SMS later)", t, warn=True)
+        _telnyx.update(balance=None, error="TELNYX_API_KEY not set")
+        return _telnyx
+    if not force and time.time() - _telnyx["at"] < TELNYX_REFRESH_S and _telnyx["balance"] is not None:
+        return _telnyx
+    own = http is None
+    http = http or aiohttp.ClientSession()
     try:
         async with http.get("https://api.telnyx.com/v2/balance", headers={"Authorization": f"Bearer {key}"},
                             timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
-                return _result("Telnyx", False, f"API key rejected: HTTP {resp.status}", t)
+                raise ValueError(f"API key rejected: HTTP {resp.status}")
             d = (await resp.json()).get("data") or {}
-        return _result("Telnyx", True, f"SIP credentials set · API ok · balance {d.get('balance')} {d.get('currency', '')}".strip(), t)
-    except (aiohttp.ClientError, TimeoutError) as e:
-        return _result("Telnyx", False, f"{type(e).__name__}: {e}", t)
+        _telnyx.update(at=time.time(), balance=float(d.get("available_credit") or d.get("balance") or 0),
+                       currency=d.get("currency") or "USD", error=None)
+    except Exception as e:  # noqa: BLE001  (network, bad JSON, a test's network guard)
+        _telnyx.update(at=time.time(), balance=None, error=f"{type(e).__name__}: {e}")
+    finally:
+        if own:
+            await http.close()
+    return _telnyx
+
+
+def telnyx_balance() -> float | None:
+    """The last known Telnyx balance (None: unknown)."""
+    return _telnyx["balance"]
+
+
+async def check_telnyx(http: aiohttp.ClientSession) -> dict:
+    t = time.perf_counter()
+    if not (os.getenv("TELNYX_SIP_USERNAME") and os.getenv("TELNYX_SIP_PASSWORD")):
+        return _result("Telnyx", False, "TELNYX_SIP_USERNAME / TELNYX_SIP_PASSWORD missing in .env", t)
+    if not (os.getenv("TELNYX_API_KEY") or "").strip():
+        return _result("Telnyx", True, "SIP credentials set. TELNYX_API_KEY not set yet (needed for texts and the balance)", t, warn=True)
+    b = await refresh_telnyx(http, force=True)
+    if b["balance"] is None:
+        return _result("Telnyx", False, b["error"] or "balance unknown", t)
+    return _result("Telnyx", True, "SIP credentials set · API ok", t)
+
+
+async def check_telnyx_balance() -> dict | None:
+    """Its own row (after check_telnyx has fetched it): a warning below $5, red at $0."""
+    t = time.perf_counter()
+    bal = _telnyx["balance"]
+    if bal is None:
+        return None
+    money = f"${bal:.2f}" if _telnyx["currency"] == "USD" else f"{bal:.2f} {_telnyx['currency']}"
+    if bal <= 0:
+        return _result("Telnyx balance", False, f"{money}: Telnyx has switched the account off. Every call is refused "
+                       "(shows as busy) and texts fail. Top up in the Telnyx portal.", t)
+    if bal < TELNYX_WARN_BELOW:
+        stop = f" The auto-dialer stops below ${TELNYX_STOP_BELOW:.2f}." if TELNYX_STOP_BELOW > 0 else ""
+        return _result("Telnyx balance", True, f"{money}: low. Top up soon: at $0 Telnyx switches the account off and "
+                       f"every call fails.{stop}", t, warn=True)
+    return _result("Telnyx balance", True, f"{money} left (prepaid; a warning below ${TELNYX_WARN_BELOW:.0f})", t)
 
 
 async def check_disk() -> dict:
@@ -210,4 +260,5 @@ async def run_all() -> list[dict]:
     async with aiohttp.ClientSession() as http:
         rest = await asyncio.gather(check_cartesia_agent(), check_cartesia_number(), check_link(), check_minutes(), check_telnyx(http),
                                     check_disk(), check_backup())
+    rest = [*rest[:5], await check_telnyx_balance(), *rest[5:]]
     return [dns, *(r for r in rest if r)]

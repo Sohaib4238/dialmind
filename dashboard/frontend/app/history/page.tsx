@@ -10,6 +10,7 @@ import { EmptyState, PageHeader, Panel, ResultTag, SkeletonLine, Tag } from "@/c
 import { EmailStatusTag, TEMPLATE_LABEL } from "@/components/emails"
 import { OutcomeTag } from "@/components/outcome"
 import { buttonVariants } from "@/components/ui/button"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, ApiError } from "@/lib/api"
 import { formatDateTime, formatDuration, formatPhone, isActive } from "@/lib/format"
 import { useLiveStream } from "@/lib/live"
@@ -20,6 +21,7 @@ const COLS = "grid grid-cols-[minmax(140px,1.2fr)_minmax(150px,1.2fr)_120px_84px
 export default function HistoryPage() {
   const [calls, setCalls] = useState<Call[] | null>(null)
   const [emails, setEmails] = useState<Record<number, Email>>({})  // follow-up email per call (latest)
+  const [provider, setProvider] = useState<"all" | "cartesia" | "phonic">("all")  // compare voice providers
 
   useEffect(() => {
     api
@@ -54,7 +56,28 @@ export default function HistoryPage() {
 
   return (
     <>
-      <PageHeader title="History" description="Every call placed from here or from the terminal, and every call to our number (Inbound)." />
+      <PageHeader
+        title="History"
+        description="Every call placed from here or from the terminal, and every call to our number (Inbound)."
+        actions={
+          calls?.some((c) => c.provider === "phonic") ? (
+            <ToggleGroup type="single" variant="outline" value={provider} onValueChange={(v) => v && setProvider(v as typeof provider)}>
+              {(["all", "cartesia", "phonic"] as const).map((p) => (
+                <ToggleGroupItem
+                  key={p}
+                  value={p}
+                  className="h-8 px-3 text-[12px] data-[state=on]:border-line-strong data-[state=on]:bg-surface-2 data-[state=on]:text-foreground"
+                >
+                  {p === "all" ? "All" : p === "cartesia" ? "Cartesia" : "Phonic"}
+                  <span className="ml-1 text-faint tnum">
+                    {p === "all" ? calls.length : calls.filter((c) => (c.provider ?? "cartesia") === p).length}
+                  </span>
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+          ) : undefined
+        }
+      />
       <Panel>
         <div className={`${COLS} h-10 border-b border-border px-4 text-[12px] text-faint`}>
           <span>Time</span>
@@ -84,7 +107,7 @@ export default function HistoryPage() {
           </EmptyState>
         ) : (
           <ul className="divide-y divide-border">
-            {calls.map((c, i) => (
+            {calls.filter((c) => provider === "all" || (c.provider ?? "cartesia") === provider).map((c, i) => (
               <motion.li
                 key={c.id}
                 layout="position"
@@ -101,6 +124,7 @@ export default function HistoryPage() {
                     <span className="font-mono tnum">{formatPhone(c.number)}</span>
                     {c.simulated && <Tag>Sim</Tag>}
                     {c.direction === "inbound" && <Tag tone="signal">Inbound</Tag>}
+                    {c.provider === "phonic" && <Tag>Phonic</Tag>}
                     {c.source === "cli" && <Tag>Terminal</Tag>}
                   </span>
                   <span>

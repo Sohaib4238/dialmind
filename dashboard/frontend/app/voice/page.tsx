@@ -8,11 +8,12 @@ import { toast } from "sonner"
 import { EmptyState, PageHeader, Panel, PanelHeader, SkeletonLine, Tag } from "@/components/common"
 import { useIsAdmin } from "@/components/login-gate"
 import { SyncBadge, syncFromSave } from "@/components/sync-badge"
+import { VoiceProviderPanel } from "@/components/voice-provider-panel"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api, ApiError } from "@/lib/api"
-import type { SyncStatus, VoiceInfo, VoiceList, VoicePayload, VoiceSettings } from "@/lib/types"
+import type { SyncStatus, VoiceInfo, VoiceList, VoicePayload, VoiceProviderName, VoiceSettings } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const GENDERS = ["All", "Female", "Male", "Neutral"] as const
@@ -77,6 +78,8 @@ export default function VoicePage() {
   const [uploading, setUploading] = useState(false)
   const uploadInput = useRef<HTMLInputElement>(null)
   const isAdmin = useIsAdmin()
+  // Provider picked in the panel at the top (null until it has loaded): Cartesia settings show only for Cartesia.
+  const [provider, setProvider] = useState<VoiceProviderName | null>(null)
   const generated = useRef(new Map<string, string>())
   const player = usePreviewPlayer()
 
@@ -205,11 +208,15 @@ export default function VoicePage() {
     <>
       <PageHeader
         title="Voice"
-        description="The Cartesia voice your agent speaks with. Saving updates the Cartesia agent right away."
-        actions={<SyncBadge sync={sync} />}
+        description="Pick the voice provider, then the voice your agent speaks with. Cartesia settings update the Cartesia agent right away."
+        actions={provider === "cartesia" ? <SyncBadge sync={sync} /> : undefined}
       />
 
-      {loadError ? (
+      <div className="mb-6">
+        <VoiceProviderPanel onProviderChange={setProvider} />
+      </div>
+
+      {provider !== "cartesia" ? null : loadError ? (
         <EmptyState action={<Button variant="secondary" size="sm" onClick={load}>Retry</Button>}>{loadError}</EmptyState>
       ) : data?.file_error ? (
         <Panel className="p-4 text-[13px] text-danger">agent_settings.yaml is invalid, fix it on the Instructions page first. {data.file_error}</Panel>

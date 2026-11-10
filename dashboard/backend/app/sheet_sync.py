@@ -302,7 +302,7 @@ def parse_row(cells: list[dict], m: dict[str, int], handled_colors: list[str], w
     location = _clean(col("location"))
     parts = [p.strip() for p in location.split(",")]
     city = parts[0] if len(parts) > 1 and not STATE_ZIP_RE.match(parts[0]) else ""
-    name = _clean(col("name"))
+    name = leads.clean_name(col("name"))  # "na" / "N/A" = no name
     if EMAIL_RE.search(name) or PHONE_RE.search(name):
         name = ""
     width = width or ((max(m.values()) + 1) if m else len(cells))
